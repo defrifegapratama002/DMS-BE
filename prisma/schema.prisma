@@ -1,0 +1,124 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// 1. Tabel Pengguna (Users)
+model User {
+  id            String         @id @default(uuid())
+  email         String         @unique
+  password_hash String
+  name          String
+  role          SystemRole     @default(EMPLOYEE)
+  created_at    DateTime       @default(now())
+  updated_at    DateTime       @updatedAt
+  DocumentShare DocumentShare[]
+  ActivityLog   ActivityLog[]
+  RefreshToken  RefreshToken[]
+  Folder        Folder[]
+}
+
+enum SystemRole {
+  SUPER_ADMIN
+  COMPANY_ADMIN
+  AUDITOR
+  EMPLOYEE
+}
+
+// 2. Tabel Folder (Self-Referencing untuk Struktur Folder Tak Terbatas)
+model Folder {
+  id                String         @id @default(uuid())
+  name              String
+  owner_id          String
+  owner             User           @relation(fields: [owner_id], references: [id])
+  parent_folder_id  String?
+  parent_folder     Folder?        @relation("FolderToFolder", fields: [parent_folder_id], references: [id], onDelete: Cascade)
+  sub_folders       Folder[]       @relation("FolderToFolder")
+  documents         Document[]
+  created_at        DateTime       @default(now())
+  updated_at        DateTime       @updatedAt
+
+  @@index([owner_id])
+}
+
+// 3. Tabel Dokumen / Berkas Utama
+model Document {
+  id          String            @id @default(uuid())
+  title       String
+  extension   String            // pdf, docx, xlsx, png, dll
+  size_bytes  BigInt
+  folder_id   String
+  folder      Folder            @relation(fields: [folder_id], references: [id])
+  current_version Int           @default(1)
+  status      DocumentStatus    @default(DRAFT)
+  versions    DocumentVersion[]
+  shares      DocumentShare[]
+  created_at  DateTime          @default(now())
+  updated_at  DateTime          @updatedAt
+}
+
+enum DocumentStatus {
+  DRAFT
+  PENDING_REVIEW
+  APPROVED
+  ARCHIVED
+}
+
+// 4. Tabel Versi Dokumen (Version Control System)
+model DocumentVersion {
+  id            String   @id @default(uuid())
+  document_id   String
+  document      Document @relation(fields: [document_id], references: [id], onDelete: Cascade)
+  version_number Int
+  s3_file_key   String   // Path lokasi file aman di Object Storage (S3)
+  uploaded_by   String
+  changelog     String?  // Catatan perubahan dokumen (misal: "Revisi pasal 4")
+  created_at    DateTime @default(now())
+}
+
+// 5. Tabel Hak Akses Berbagi Berkas (Granular Access Control)
+model DocumentShare {
+  id          String      @id @default(uuid())
+  document_id String
+  document    Document    @relation(fields: [document_id], references: [id], onDelete: Cascade)
+  user_id     String
+  user        User        @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  access_level AccessLevel @default(VIEWER)
+  created_at  DateTime    @default(now())
+}
+
+enum AccessLevel {
+  VIEWER       // Hanya pratinjau, tombol unduh mati
+  DOWNLOADER   // Bisa lihat dan unduh berkas asli
+  EDITOR       // Bisa unggah versi baru dan edit judul
+}
+
+// 6. Tabel Audit Log (Melacak kepatuhan aktivitas pengguna)
+model ActivityLog {
+  id          String   @id @default(uuid())
+  user_id     String
+  user        User     @relation(fields: [user_id], references: [id])
+  action      String   // DOWNLOAD, VIEW, UPLOAD_REVISION, DELETE, SHARE
+  details     String   // Detail aktivitas log
+  ip_address  String
+  created_at  DateTime @default(now())
+}
+
+model RefreshToken {
+  id          String    @id @default(uuid())
+  user_id     String
+  user        User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  token_hash  String    @unique
+  expires_at  DateTime
+  revoked_at  DateTime?
+  replaced_by String?   // menyimpan id token pengganti (untuk reuse detection)
+  created_at  DateTime  @default(now())
+
+  @@index([user_id])
+}
