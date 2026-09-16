@@ -12,6 +12,7 @@ import {
   purgeDocument,
   emptyTrash,
 } from '../controllers/documentController.js';
+import { DocumentMetaController } from '../controllers/metadataController.js';
 import { verifyToken } from '../middlewares/verifyToken.js';
 import { checkRole } from '../middlewares/checkRole.js';
 import { upload } from '../middlewares/upload.js';
@@ -20,7 +21,7 @@ const router = Router();
 
 router.use(verifyToken);
 
-// ⚠️ Trash routes HARUS di atas /:id (Express match dari atas)
+// ⚠️ Route statis HARUS di atas route dinamis /:id
 router.get('/trash', getTrash);
 router.delete(
   '/trash',
@@ -28,7 +29,13 @@ router.delete(
   emptyTrash
 );
 
-// Documents
+router.post(
+  '/bulk-meta',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
+  DocumentMetaController.bulkUpdateMeta
+);
+
+// Documents CRUD
 router.get('/', getDocuments);
 
 router.post(
@@ -46,6 +53,13 @@ router.patch(
   updateDocument
 );
 
+// ✅ Metadata update
+router.patch(
+  '/:id/meta',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
+  DocumentMetaController.updateMeta
+);
+
 router.post(
   '/:id/versions',
   checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
@@ -55,17 +69,14 @@ router.post(
 
 router.get('/:id/versions', getDocumentVersions);
 
-// Restore (sebelum delete /:id)
 router.post('/:id/restore', restoreDocument);
 
-// Purge permanent
 router.delete(
   '/:id/purge',
   checkRole('SUPER_ADMIN', 'COMPANY_ADMIN'),
   purgeDocument
 );
 
-// Soft delete → trash
 router.delete(
   '/:id',
   checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),

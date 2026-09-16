@@ -203,6 +203,10 @@ export const getDocumentDetail = async (
         shares: {
           include: { user: { select: { id: true, name: true, email: true } } },
         },
+        // ✅ TAMBAH 3 INCLUDE INI
+        documentType: true,
+        correspondent: true,
+        documentTags: { include: { tag: true } },
       },
     });
 
@@ -211,7 +215,6 @@ export const getDocumentDetail = async (
       return;
     }
 
-    // ✅ Trashed documents hanya bisa dilihat lewat endpoint /trash
     if (document.deletedAt) {
       res.status(404).json({
         success: false,

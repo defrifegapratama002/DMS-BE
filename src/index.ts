@@ -12,6 +12,7 @@ import folderRoutes from './routes/folderRoutes.js';
 import shareRoutes from './routes/shareRoutes.js';
 import activityLogRoutes from './routes/activityLogRoutes.js';
 import userRoutes from './routes/userRoutes.js';
+import metadataRoutes from './routes/metadataRoutes.js';
 
 dotenv.config();
 
@@ -40,6 +41,8 @@ app.use('/api/folders', folderRoutes);
 app.use('/api/shares', shareRoutes);
 app.use('/api/activity-logs', activityLogRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/metadata', metadataRoutes);
+
 
 app.get('/healthz', (req, res) => {
   res.json({
