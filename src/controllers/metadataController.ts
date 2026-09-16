@@ -442,56 +442,68 @@ export class DocumentMetaController {
   }
 
   static async bulkUpdateMeta(req: AuthRequest, res: Response): Promise<void> {
-    try {
-      const userId = req.user!.id;
-      const { ids, tagIds, documentTypeId, correspondentId } = req.body;
+  try {
+    const userId = req.user!.id;
+    const {
+      ids,
+      addTagIds,
+      removeTagIds,
+      documentTypeId,
+      correspondentId,
+    } = req.body;
 
-      if (!Array.isArray(ids) || ids.length === 0) {
-        res.status(400).json({ success: false, message: 'ids array required' });
-        return;
-      }
-
-      const results = [];
-
-      for (const docId of ids) {
-        const doc = await prisma.document.findUnique({ where: { id: docId } });
-        if (!doc || doc.deletedAt || doc.uploadedBy !== userId) continue;
-
-        const updateData: any = {};
-        if (documentTypeId !== undefined) updateData.documentTypeId = documentTypeId;
-        if (correspondentId !== undefined) updateData.correspondentId = correspondentId;
-
-        await prisma.document.update({ where: { id: docId }, data: updateData });
-
-        if (Array.isArray(tagIds)) {
-          await prisma.documentTag.deleteMany({ where: { documentId: docId } });
-          if (tagIds.length > 0) {
-            await prisma.documentTag.createMany({
-              data: tagIds.map((tagId: string) => ({ documentId: docId, tagId })),
-              skipDuplicates: true,
-            });
-          }
-        }
-
-        results.push(docId);
-      }
-
-      await logActivityWithRequest(
-        req,
-        userId,
-        'UPDATE_DOCUMENT_META',
-        { count: results.length, mode: 'bulk' },
-        'DOCUMENT'
-      );
-
-      res.json({
-        success: true,
-        message: `${results.length} documents updated`,
-        data: { updated: results },
-      });
-    } catch (error) {
-      console.error('Bulk update error:', error);
-      res.status(500).json({ success: false, message: 'Internal server error' });
+    if (!Array.isArray(ids) || ids.length === 0) {
+      res.status(400).json({ success: false, message: 'ids array required' });
+      return;
     }
+
+    const results: string[] = [];
+
+    for (const docId of ids) {
+      const doc = await prisma.document.findUnique({ where: { id: docId } });
+      if (!doc || doc.deletedAt || doc.uploadedBy !== userId) continue;
+
+      const updateData: any = {};
+      if (documentTypeId !== undefined) updateData.documentTypeId = documentTypeId;
+      if (correspondentId !== undefined) updateData.correspondentId = correspondentId;
+
+      if (Object.keys(updateData).length > 0) {
+        await prisma.document.update({ where: { id: docId }, data: updateData });
+      }
+
+      // ✅ Handle add/remove tags
+      if (Array.isArray(removeTagIds) && removeTagIds.length > 0) {
+        await prisma.documentTag.deleteMany({
+          where: { documentId: docId, tagId: { in: removeTagIds } },
+        });
+      }
+
+      if (Array.isArray(addTagIds) && addTagIds.length > 0) {
+        await prisma.documentTag.createMany({
+          data: addTagIds.map((tagId: string) => ({ documentId: docId, tagId })),
+          skipDuplicates: true,
+        });
+      }
+
+      results.push(docId);
+    }
+
+    await logActivityWithRequest(
+      req,
+      userId,
+      'UPDATE_DOCUMENT_META',
+      { count: results.length, mode: 'bulk' },
+      'DOCUMENT'
+    );
+
+    res.json({
+      success: true,
+      message: `${results.length} documents updated`,
+      data: { updated: results },
+    });
+  } catch (error) {
+    console.error('Bulk update error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
+}
 }

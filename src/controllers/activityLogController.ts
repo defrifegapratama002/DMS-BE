@@ -12,6 +12,7 @@ export class ActivityLogController {
         action,
         entityType,
         entityId,
+        document_id,
         startDate,
         endDate,
         page = 1,
@@ -33,6 +34,7 @@ export class ActivityLogController {
       if (action) where.action = action;
       if (entityType) where.entityType = entityType;
       if (entityId) where.entityId = entityId;
+      if (req.query.document_id) where.documentId = req.query.document_id as string;
       if (startDate || endDate) {
         where.createdAt = {};
         if (startDate) where.createdAt.gte = new Date(startDate as string);
