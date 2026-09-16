@@ -1,4 +1,4 @@
-import type { Request, Response } from 'express';
+import type { Response } from 'express';
 import { prisma } from '../config/prisma.js';
 import { z } from 'zod';
 import fs from 'fs';
@@ -6,6 +6,7 @@ import path from 'path';
 import type { AuthRequest } from '../types/index.js';
 import { logActivityWithRequest } from '../utils/activityLogger.js';
 
+// ============ Validation ============
 const createDocumentSchema = z.object({
   title: z.string().min(1),
   description: z.string().optional(),
@@ -15,18 +16,27 @@ const createDocumentSchema = z.object({
 const updateDocumentSchema = z.object({
   title: z.string().min(1).optional(),
   description: z.string().optional(),
-  status: z.enum(['DRAFT', 'PENDING_REVIEW', 'APPROVED', 'ARCHIVED']).optional(),
+  status: z
+    .enum(['DRAFT', 'PENDING_REVIEW', 'APPROVED', 'ARCHIVED'])
+    .optional(),
 });
 
-// ============ GET ALL ============
-export const getDocuments = async (req: AuthRequest, res: Response): Promise<void> => {
+// ============ GET ALL (exclude trash) ============
+export const getDocuments = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
   try {
     const userId = req.user!.id;
     const { folderId, search, status, page = 1, limit = 10 } = req.query;
 
-    const where: any = {};
+    const where: any = {
+      deletedAt: null, // ✅ Exclude trashed documents
+    };
+
     if (folderId) where.folderId = folderId as string;
     if (status) where.status = status as string;
+
     if (search) {
       where.OR = [
         { title: { contains: search as string, mode: 'insensitive' } },
@@ -55,7 +65,7 @@ export const getDocuments = async (req: AuthRequest, res: Response): Promise<voi
           },
           shares: {
             where: { userId },
-            select: { accessLevel: true, userId: true }, // ✅ userId disertakan
+            select: { accessLevel: true, userId: true },
           },
         },
         skip,
@@ -93,7 +103,10 @@ export const getDocuments = async (req: AuthRequest, res: Response): Promise<voi
 };
 
 // ============ UPLOAD ============
-export const uploadDocument = async (req: AuthRequest, res: Response): Promise<void> => {
+export const uploadDocument = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
   try {
     const userId = req.user!.id;
     const validated = createDocumentSchema.parse(req.body);
@@ -110,7 +123,9 @@ export const uploadDocument = async (req: AuthRequest, res: Response): Promise<v
 
     if (!folder) {
       if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
-      res.status(404).json({ success: false, message: 'Folder not found or not owned' });
+      res
+        .status(404)
+        .json({ success: false, message: 'Folder not found or not owned' });
       return;
     }
 
@@ -143,7 +158,12 @@ export const uploadDocument = async (req: AuthRequest, res: Response): Promise<v
       req,
       userId,
       'CREATE_DOCUMENT',
-      { title: document.title, fileName: file.originalname, fileSize: file.size, version: 1 },
+      {
+        title: document.title,
+        fileName: file.originalname,
+        fileSize: file.size,
+        version: 1,
+      },
       'DOCUMENT',
       document.id
     );
@@ -155,7 +175,9 @@ export const uploadDocument = async (req: AuthRequest, res: Response): Promise<v
     });
   } catch (error) {
     if (error instanceof z.ZodError) {
-      res.status(400).json({ success: false, message: 'Validation error', errors: error.issues });
+      res
+        .status(400)
+        .json({ success: false, message: 'Validation error', errors: error.issues });
       return;
     }
     console.error('Upload document error:', error);
@@ -164,7 +186,10 @@ export const uploadDocument = async (req: AuthRequest, res: Response): Promise<v
 };
 
 // ============ DETAIL ============
-export const getDocumentDetail = async (req: AuthRequest, res: Response): Promise<void> => {
+export const getDocumentDetail = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
   try {
     const id = req.params.id as string;
     const userId = req.user!.id;
@@ -186,8 +211,18 @@ export const getDocumentDetail = async (req: AuthRequest, res: Response): Promis
       return;
     }
 
+    // ✅ Trashed documents hanya bisa dilihat lewat endpoint /trash
+    if (document.deletedAt) {
+      res.status(404).json({
+        success: false,
+        message: 'Document not found (in trash)',
+      });
+      return;
+    }
+
     const userShare = document.shares.find((s) => s.userId === userId);
-    const hasAccess = document.uploadedBy === userId || userShare || document.status === 'APPROVED';
+    const hasAccess =
+      document.uploadedBy === userId || userShare || document.status === 'APPROVED';
 
     if (!hasAccess) {
       res.status(403).json({ success: false, message: 'Access denied' });
@@ -220,7 +255,10 @@ export const getDocumentDetail = async (req: AuthRequest, res: Response): Promis
 };
 
 // ============ UPDATE / RENAME ============
-export const updateDocument = async (req: AuthRequest, res: Response): Promise<void> => {
+export const updateDocument = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
   try {
     const id = req.params.id as string;
     const userId = req.user!.id;
@@ -229,6 +267,15 @@ export const updateDocument = async (req: AuthRequest, res: Response): Promise<v
     const existing = await prisma.document.findUnique({ where: { id } });
     if (!existing) {
       res.status(404).json({ success: false, message: 'Document not found' });
+      return;
+    }
+
+    // ✅ Tidak bisa update dokumen di trash
+    if (existing.deletedAt) {
+      res.status(400).json({
+        success: false,
+        message: 'Cannot update a document in trash. Restore it first.',
+      });
       return;
     }
 
@@ -241,7 +288,10 @@ export const updateDocument = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const updated = await prisma.document.update({ where: { id }, data: validated });
+    const updated = await prisma.document.update({
+      where: { id },
+      data: validated,
+    });
 
     await logActivityWithRequest(
       req,
@@ -252,10 +302,16 @@ export const updateDocument = async (req: AuthRequest, res: Response): Promise<v
       updated.id
     );
 
-    res.json({ success: true, message: 'Document updated successfully', data: updated });
+    res.json({
+      success: true,
+      message: 'Document updated successfully',
+      data: updated,
+    });
   } catch (error) {
     if (error instanceof z.ZodError) {
-      res.status(400).json({ success: false, message: 'Validation error', errors: error.issues });
+      res
+        .status(400)
+        .json({ success: false, message: 'Validation error', errors: error.issues });
       return;
     }
     console.error('Update document error:', error);
@@ -265,7 +321,10 @@ export const updateDocument = async (req: AuthRequest, res: Response): Promise<v
 export const renameDocument = updateDocument;
 
 // ============ UPLOAD NEW VERSION ============
-export const uploadNewVersion = async (req: AuthRequest, res: Response): Promise<void> => {
+export const uploadNewVersion = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
   try {
     const id = req.params.id as string;
     const userId = req.user!.id;
@@ -288,10 +347,24 @@ export const uploadNewVersion = async (req: AuthRequest, res: Response): Promise
       return;
     }
 
-    const hasEditAccess = document.uploadedBy === userId || document.shares.length > 0;
+    // ✅ Tidak bisa upload versi baru ke dokumen di trash
+    if (document.deletedAt) {
+      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      res.status(400).json({
+        success: false,
+        message: 'Cannot upload version to a document in trash',
+      });
+      return;
+    }
+
+    const hasEditAccess =
+      document.uploadedBy === userId || document.shares.length > 0;
     if (!hasEditAccess) {
       if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
-      res.status(403).json({ success: false, message: 'Access denied. EDITOR access required.' });
+      res.status(403).json({
+        success: false,
+        message: 'Access denied. EDITOR access required.',
+      });
       return;
     }
 
@@ -328,7 +401,11 @@ export const uploadNewVersion = async (req: AuthRequest, res: Response): Promise
       document.id
     );
 
-    res.json({ success: true, message: 'New version uploaded', data: updatedDocument });
+    res.json({
+      success: true,
+      message: 'New version uploaded',
+      data: updatedDocument,
+    });
   } catch (error) {
     console.error('Upload version error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
@@ -336,7 +413,10 @@ export const uploadNewVersion = async (req: AuthRequest, res: Response): Promise
 };
 
 // ============ VERSIONS ============
-export const getDocumentVersions = async (req: AuthRequest, res: Response): Promise<void> => {
+export const getDocumentVersions = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
   try {
     const id = req.params.id as string;
     const userId = req.user!.id;
@@ -344,6 +424,7 @@ export const getDocumentVersions = async (req: AuthRequest, res: Response): Prom
     const document = await prisma.document.findFirst({
       where: {
         id,
+        deletedAt: null, // ✅ Exclude trashed
         OR: [
           { uploadedBy: userId },
           {
@@ -359,7 +440,9 @@ export const getDocumentVersions = async (req: AuthRequest, res: Response): Prom
     });
 
     if (!document) {
-      res.status(404).json({ success: false, message: 'Not found or access denied' });
+      res
+        .status(404)
+        .json({ success: false, message: 'Not found or access denied' });
       return;
     }
 
@@ -376,8 +459,11 @@ export const getDocumentVersions = async (req: AuthRequest, res: Response): Prom
 };
 export const getVersionHistory = getDocumentVersions;
 
-// ============ DELETE ============
-export const deleteDocument = async (req: AuthRequest, res: Response): Promise<void> => {
+// ============ DELETE (soft delete → trash) ============
+export const deleteDocument = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
   try {
     const id = req.params.id as string;
     const userId = req.user!.id;
@@ -388,8 +474,134 @@ export const deleteDocument = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const versions = await prisma.documentVersion.findMany({ where: { documentId: id } });
-    for (const v of versions) {
+    if (document.deletedAt) {
+      res
+        .status(400)
+        .json({ success: false, message: 'Document is already in trash' });
+      return;
+    }
+
+    // Soft delete: set deletedAt
+    await prisma.document.update({
+      where: { id },
+      data: { deletedAt: new Date() },
+    });
+
+    await logActivityWithRequest(
+      req,
+      userId,
+      'DELETE_DOCUMENT',
+      { title: document.title, mode: 'soft-delete' },
+      'DOCUMENT',
+      id
+    );
+
+    res.json({ success: true, message: 'Document moved to trash' });
+  } catch (error) {
+    console.error('Delete document error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// ============ GET TRASH ============
+export const getTrash = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+
+    const documents = await prisma.document.findMany({
+      where: {
+        deletedAt: { not: null },
+        OR: [{ uploadedBy: userId }, { folder: { ownerId: userId } }],
+      },
+      include: {
+        folder: { select: { id: true, name: true } },
+      },
+      orderBy: { deletedAt: 'desc' },
+    });
+
+    res.json({ success: true, data: documents });
+  } catch (error) {
+    console.error('Get trash error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// ============ RESTORE FROM TRASH ============
+export const restoreDocument = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const userId = req.user!.id;
+
+    const document = await prisma.document.findUnique({ where: { id } });
+    if (!document) {
+      res.status(404).json({ success: false, message: 'Document not found' });
+      return;
+    }
+
+    if (!document.deletedAt) {
+      res
+        .status(400)
+        .json({ success: false, message: 'Document is not in trash' });
+      return;
+    }
+
+    await prisma.document.update({
+      where: { id },
+      data: { deletedAt: null },
+    });
+
+    await logActivityWithRequest(
+      req,
+      userId,
+      'RESTORE_DOCUMENT',
+      { title: document.title },
+      'DOCUMENT',
+      id
+    );
+
+    res.json({ success: true, message: 'Document restored successfully' });
+  } catch (error) {
+    console.error('Restore document error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// ============ PERMANENT DELETE ============
+export const purgeDocument = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const userId = req.user!.id;
+
+    const document = await prisma.document.findUnique({
+      where: { id },
+      include: { versions: true },
+    });
+
+    if (!document) {
+      res.status(404).json({ success: false, message: 'Document not found' });
+      return;
+    }
+
+    // Hanya bisa purge dokumen yang ada di trash
+    if (!document.deletedAt) {
+      res.status(400).json({
+        success: false,
+        message: 'Document must be in trash before permanent delete',
+      });
+      return;
+    }
+
+    // Delete physical files
+    for (const v of document.versions) {
       if (v.s3FileKey && fs.existsSync(v.s3FileKey)) {
         try {
           fs.unlinkSync(v.s3FileKey);
@@ -399,20 +611,74 @@ export const deleteDocument = async (req: AuthRequest, res: Response): Promise<v
       }
     }
 
+    // Cascade delete (versions, shares, documentTags, notes)
     await prisma.document.delete({ where: { id } });
 
     await logActivityWithRequest(
       req,
       userId,
       'DELETE_DOCUMENT',
-      { title: document.title },
+      { title: document.title, mode: 'permanent' },
       'DOCUMENT',
       id
     );
 
-    res.json({ success: true, message: 'Document deleted successfully' });
+    res.json({ success: true, message: 'Document permanently deleted' });
   } catch (error) {
-    console.error('Delete document error:', error);
+    console.error('Purge document error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// ============ EMPTY TRASH ============
+export const emptyTrash = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+
+    const documents = await prisma.document.findMany({
+      where: {
+        deletedAt: { not: null },
+        OR: [{ uploadedBy: userId }, { folder: { ownerId: userId } }],
+      },
+      include: { versions: true },
+    });
+
+    // Delete all physical files
+    for (const doc of documents) {
+      for (const v of doc.versions) {
+        if (v.s3FileKey && fs.existsSync(v.s3FileKey)) {
+          try {
+            fs.unlinkSync(v.s3FileKey);
+          } catch (e) {
+            console.error('Failed to delete file:', v.s3FileKey, e);
+          }
+        }
+      }
+    }
+
+    // Delete from DB
+    await prisma.document.deleteMany({
+      where: { id: { in: documents.map((d) => d.id) } },
+    });
+
+    await logActivityWithRequest(
+      req,
+      userId,
+      'DELETE_DOCUMENT',
+      { count: documents.length, mode: 'empty-trash' },
+      'DOCUMENT'
+    );
+
+    res.json({
+      success: true,
+      message: `${documents.length} documents permanently deleted`,
+      data: { count: documents.length },
+    });
+  } catch (error) {
+    console.error('Empty trash error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
