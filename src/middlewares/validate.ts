@@ -1,49 +1,28 @@
 import type { Request, Response, NextFunction } from 'express';
-import { ZodError, type ZodSchema } from 'zod';
+import { ZodError, type ZodTypeAny } from 'zod';
 
-export interface RequestWithValidatedQuery<T = unknown> extends Request {
-  validatedQuery?: T;
-}
-
-export function validateBody(schema: ZodSchema) {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const result = schema.safeParse(req.body);
-
-    if (!result.success) {
-      res.status(400).json({
-        message: 'Data yang dikirim tidak valid.',
-        errors: formatZodError(result.error),
+export const validate = (schema: ZodTypeAny) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      await schema.parseAsync({
+        body: req.body,
+        query: req.query,
+        params: req.params,
       });
-      return;
+      next();
+    } catch (error) {
+      if (error instanceof ZodError) {
+        res.status(400).json({
+          success: false,
+          message: 'Validation error',
+          errors: error.issues,
+        });
+        return;
+      }
+      res.status(500).json({ success: false, message: 'Internal server error' });
     }
-
-    req.body = result.data;
-    next();
   };
-}
+};
 
-export function validateQuery(schema: ZodSchema) {
-  return (req: RequestWithValidatedQuery, res: Response, next: NextFunction): void => {
-    const result = schema.safeParse(req.query);
-
-    if (!result.success) {
-      res.status(400).json({
-        message: 'Parameter query tidak valid.',
-        errors: formatZodError(result.error),
-      });
-      return;
-    }
-
-    req.validatedQuery = result.data;
-    next();
-  };
-}
-
-function formatZodError(error: ZodError): Record<string, string> {
-  const formatted: Record<string, string> = {};
-  for (const issue of error.issues) {
-    const path = issue.path.join('.') || 'root';
-    formatted[path] = issue.message;
-  }
-  return formatted;
-}
+export const validateBody = validate;
+export const validateQuery = validate;

@@ -1,343 +1,422 @@
 import type { Request, Response } from 'express';
-import crypto from 'crypto';
 import { prisma } from '../config/prisma.js';
-import { logActivity, getClientIp } from '../utils/activityLogger.js';
+import { z } from 'zod';
+import fs from 'fs';
+import path from 'path';
+import type { AuthRequest } from '../types/index.js';
+import { logActivityWithRequest } from '../utils/activityLogger.js';
 
-interface AuthRequest extends Request {
-  user?: {
-    userId: string;
-    role: string;
-  };
-}
+const createDocumentSchema = z.object({
+  title: z.string().min(1),
+  description: z.string().optional(),
+  folderId: z.string().uuid(),
+});
 
-function canModifyDocument(userRole: string, userId: string, folderOwnerId: string): boolean {
-  if (userRole === 'SUPER_ADMIN' || userRole === 'COMPANY_ADMIN') return true;
-  return userId === folderOwnerId;
-}
+const updateDocumentSchema = z.object({
+  title: z.string().min(1).optional(),
+  description: z.string().optional(),
+  status: z.enum(['DRAFT', 'PENDING_REVIEW', 'APPROVED', 'ARCHIVED']).optional(),
+});
 
-// Helper BARU: menentukan apakah user boleh MELIHAT dokumen (lebih longgar dari canModifyDocument,
-// karena mencakup akses via DocumentShare dan role AUDITOR yang read-only).
-async function canViewDocument(
-  userRole: string,
-  userId: string,
-  folderOwnerId: string,
-  documentId: string
-): Promise<boolean> {
-  if (userRole === 'SUPER_ADMIN' || userRole === 'COMPANY_ADMIN' || userRole === 'AUDITOR') return true;
-  if (userId === folderOwnerId) return true;
-
-  const share = await prisma.documentShare.findFirst({
-    where: { document_id: documentId, user_id: userId },
-  });
-  return share !== null;
-}
-
-// 1. FUNGSI MEMBUAT DOKUMEN BARU (DRAFT)
-export const createDocument = async (req: AuthRequest, res: Response): Promise<void> => {
+// ============ GET ALL ============
+export const getDocuments = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { title, extension, size_bytes, folder_id } = req.body;
+    const userId = req.user!.id;
+    const { folderId, search, status, page = 1, limit = 10 } = req.query;
 
-    if (!title || typeof title !== 'string' || title.trim().length === 0) {
-      res.status(400).json({ message: 'Judul dokumen wajib diisi.' });
-      return;
-    }
-    if (!extension || typeof extension !== 'string') {
-      res.status(400).json({ message: 'Ekstensi berkas wajib diisi.' });
-      return;
-    }
-    if (size_bytes === undefined || size_bytes === null || isNaN(Number(size_bytes))) {
-      res.status(400).json({ message: 'Ukuran berkas (size_bytes) wajib diisi dan berupa angka.' });
-      return;
-    }
-    if (!folder_id || typeof folder_id !== 'string') {
-      res.status(400).json({ message: 'folder_id wajib diisi.' });
-      return;
+    const where: any = {};
+    if (folderId) where.folderId = folderId as string;
+    if (status) where.status = status as string;
+    if (search) {
+      where.OR = [
+        { title: { contains: search as string, mode: 'insensitive' } },
+        { description: { contains: search as string, mode: 'insensitive' } },
+      ];
     }
 
-    const folder = await prisma.folder.findUnique({ where: { id: folder_id } });
-    if (!folder) {
-      res.status(404).json({ message: 'Folder tujuan tidak ditemukan.' });
-      return;
-    }
+    const pageNum = Number(page);
+    const limitNum = Number(limit);
+    const skip = (pageNum - 1) * limitNum;
 
-    if (!canModifyDocument(req.user!.role, req.user!.userId, folder.owner_id)) {
-      res.status(403).json({ message: 'Anda tidak memiliki izin untuk menambah dokumen di folder ini.' });
-      return;
-    }
-
-    const placeholderKey = `pending-upload/${crypto.randomUUID()}.${extension}`;
-
-    const newDocument = await prisma.$transaction(async (tx) => {
-      const document = await tx.document.create({
-        data: {
-          title: title.trim(),
-          extension,
-          size_bytes: BigInt(size_bytes),
-          folder_id,
-          current_version: 1,
-          status: 'DRAFT',
+    const [documents, total] = await Promise.all([
+      prisma.document.findMany({
+        where,
+        include: {
+          folder: { select: { id: true, name: true } },
+          versions: {
+            orderBy: { versionNumber: 'desc' },
+            take: 1,
+            select: {
+              id: true,
+              versionNumber: true,
+              changelog: true,
+              createdAt: true,
+            },
+          },
+          shares: {
+            where: { userId },
+            select: { accessLevel: true, userId: true }, // ✅ userId disertakan
+          },
         },
-      });
+        skip,
+        take: limitNum,
+        orderBy: { updatedAt: 'desc' },
+      }),
+      prisma.document.count({ where }),
+    ]);
 
-      await tx.documentVersion.create({
-        data: {
-          document_id: document.id,
-          version_number: 1,
-          s3_file_key: placeholderKey,
-          uploaded_by: req.user!.userId,
-          changelog: 'Versi awal dokumen.',
-        },
-      });
-
-      return document;
+    const documentsWithAccess = documents.map((doc) => {
+      const userShare = doc.shares.find((s) => s.userId === userId);
+      return {
+        ...doc,
+        accessLevel: userShare?.accessLevel || null,
+        isOwner: doc.uploadedBy === userId,
+      };
     });
 
-    await logActivity({
-        userId: req.user!.userId,
-        action: 'CREATE_DOCUMENT',
-        details: `Membuat dokumen "${newDocument.title}" (ID: ${newDocument.id}) di folder ${folder_id}`,
-        ipAddress: getClientIp(req),
-        });
-
-    res.status(201).json({
-      message: 'Dokumen berhasil dibuat. Menunggu integrasi upload berkas ke Object Storage.',
-      document: {
-        ...newDocument,
-        size_bytes: newDocument.size_bytes.toString(),
+    res.json({
+      success: true,
+      data: {
+        documents: documentsWithAccess,
+        pagination: {
+          page: pageNum,
+          limit: limitNum,
+          total,
+          totalPages: Math.ceil(total / limitNum),
+        },
       },
     });
   } catch (error) {
-    console.error('Create Document Error:', error);
-    res.status(500).json({ message: 'Terjadi kegagalan server saat membuat dokumen.' });
+    console.error('Get documents error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
-// 2. FUNGSI MELIHAT DETAIL DOKUMEN — DIPERBARUI dengan pengecekan DocumentShare
-export const getDocumentById = async (req: AuthRequest, res: Response): Promise<void> => {
+// ============ UPLOAD ============
+export const uploadDocument = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { id } = req.params as { id: string };
+    const userId = req.user!.id;
+    const validated = createDocumentSchema.parse(req.body);
+    const file = (req as any).file as Express.Multer.File | undefined;
+
+    if (!file) {
+      res.status(400).json({ success: false, message: 'File is required' });
+      return;
+    }
+
+    const folder = await prisma.folder.findFirst({
+      where: { id: validated.folderId, ownerId: userId },
+    });
+
+    if (!folder) {
+      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      res.status(404).json({ success: false, message: 'Folder not found or not owned' });
+      return;
+    }
+
+    const document = await prisma.document.create({
+      data: {
+        title: validated.title,
+        extension: path.extname(file.originalname).slice(1),
+        sizeBytes: BigInt(file.size),
+        folderId: validated.folderId,
+        description: validated.description || '',
+        uploadedBy: userId,
+        currentVersion: 1,
+        status: 'DRAFT',
+        versions: {
+          create: {
+            versionNumber: 1,
+            s3FileKey: file.path,
+            uploadedBy: userId,
+            changelog: 'Initial upload',
+          },
+        },
+      },
+      include: {
+        folder: { select: { id: true, name: true } },
+        versions: { orderBy: { versionNumber: 'desc' }, take: 1 },
+      },
+    });
+
+    await logActivityWithRequest(
+      req,
+      userId,
+      'CREATE_DOCUMENT',
+      { title: document.title, fileName: file.originalname, fileSize: file.size, version: 1 },
+      'DOCUMENT',
+      document.id
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Document uploaded successfully',
+      data: document,
+    });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ success: false, message: 'Validation error', errors: error.issues });
+      return;
+    }
+    console.error('Upload document error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// ============ DETAIL ============
+export const getDocumentDetail = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const userId = req.user!.id;
 
     const document = await prisma.document.findUnique({
       where: { id },
       include: {
-        versions: { orderBy: { version_number: 'desc' } },
         folder: true,
+        uploadedByUser: { select: { id: true, name: true, email: true } },
+        versions: { orderBy: { versionNumber: 'desc' } },
+        shares: {
+          include: { user: { select: { id: true, name: true, email: true } } },
+        },
       },
     });
 
     if (!document) {
-      res.status(404).json({ message: 'Dokumen tidak ditemukan.' });
+      res.status(404).json({ success: false, message: 'Document not found' });
       return;
     }
 
-    const allowed = await canViewDocument(
-      req.user!.role,
-      req.user!.userId,
-      document.folder.owner_id,
+    const userShare = document.shares.find((s) => s.userId === userId);
+    const hasAccess = document.uploadedBy === userId || userShare || document.status === 'APPROVED';
+
+    if (!hasAccess) {
+      res.status(403).json({ success: false, message: 'Access denied' });
+      return;
+    }
+
+    await logActivityWithRequest(
+      req,
+      userId,
+      'VIEW_DOCUMENT',
+      { title: document.title, version: document.currentVersion },
+      'DOCUMENT',
       document.id
     );
 
-    if (!allowed) {
-      res.status(403).json({ message: 'Anda tidak memiliki izin untuk melihat dokumen ini.' });
-      return;
-    }
-
-    res.status(200).json({
-      document: {
+    res.json({
+      success: true,
+      data: {
         ...document,
-        size_bytes: document.size_bytes.toString(),
+        userAccess: {
+          isOwner: document.uploadedBy === userId,
+          accessLevel: userShare?.accessLevel || null,
+        },
       },
     });
   } catch (error) {
-    console.error('Get Document Error:', error);
-    res.status(500).json({ message: 'Terjadi kegagalan server saat mengambil detail dokumen.' });
+    console.error('Get document detail error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
-// ... renameDocument, uploadNewVersion tetap sama (pakai canModifyDocument) ...
-export const renameDocument = async (req: AuthRequest, res: Response): Promise<void> => {
+// ============ UPDATE / RENAME ============
+export const updateDocument = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { id } = req.params as { id: string };
-    const { title } = req.body;
+    const id = req.params.id as string;
+    const userId = req.user!.id;
+    const validated = updateDocumentSchema.parse(req.body);
 
-    if (!title || typeof title !== 'string' || title.trim().length === 0) {
-      res.status(400).json({ message: 'Judul dokumen baru wajib diisi.' });
+    const existing = await prisma.document.findUnique({ where: { id } });
+    if (!existing) {
+      res.status(404).json({ success: false, message: 'Document not found' });
       return;
     }
 
-    const document = await prisma.document.findUnique({
-      where: { id },
-      include: { folder: true },
+    const userShare = await prisma.documentShare.findFirst({
+      where: { documentId: id, userId, accessLevel: 'EDITOR' },
     });
 
-    if (!document) {
-      res.status(404).json({ message: 'Dokumen tidak ditemukan.' });
+    if (existing.uploadedBy !== userId && !userShare) {
+      res.status(403).json({ success: false, message: 'Access denied' });
       return;
     }
 
-    if (!canModifyDocument(req.user!.role, req.user!.userId, document.folder.owner_id)) {
-      res.status(403).json({ message: 'Anda tidak memiliki izin untuk mengubah dokumen ini.' });
-      return;
-    }
+    const updated = await prisma.document.update({ where: { id }, data: validated });
 
-    const updated = await prisma.document.update({
-      where: { id },
-      data: { title: title.trim() },
-    });
+    await logActivityWithRequest(
+      req,
+      userId,
+      'RENAME_DOCUMENT',
+      { title: updated.title, changes: validated },
+      'DOCUMENT',
+      updated.id
+    );
 
-    await logActivity({
-        userId: req.user!.userId,
-        action: 'RENAME_DOCUMENT',
-        details: `Mengganti judul dokumen "${document.title}" menjadi "${updated.title}" (ID: ${id})`,
-        ipAddress: getClientIp(req),
-        });
-
-    res.status(200).json({
-      message: 'Judul dokumen berhasil diperbarui.',
-      document: { ...updated, size_bytes: updated.size_bytes.toString() },
-    });
+    res.json({ success: true, message: 'Document updated successfully', data: updated });
   } catch (error) {
-    console.error('Rename Document Error:', error);
-    res.status(500).json({ message: 'Terjadi kegagalan server saat mengubah judul dokumen.' });
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ success: false, message: 'Validation error', errors: error.issues });
+      return;
+    }
+    console.error('Update document error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
+export const renameDocument = updateDocument;
 
+// ============ UPLOAD NEW VERSION ============
 export const uploadNewVersion = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { id } = req.params as { id: string };
-    const { size_bytes, changelog, extension } = req.body;
+    const id = req.params.id as string;
+    const userId = req.user!.id;
+    const { changelog } = req.body;
+    const file = (req as any).file as Express.Multer.File | undefined;
 
-    if (size_bytes === undefined || size_bytes === null || isNaN(Number(size_bytes))) {
-      res.status(400).json({ message: 'Ukuran berkas (size_bytes) wajib diisi dan berupa angka.' });
+    if (!file) {
+      res.status(400).json({ success: false, message: 'File is required' });
       return;
     }
 
     const document = await prisma.document.findUnique({
       where: { id },
-      include: { folder: true },
+      include: { shares: { where: { userId, accessLevel: 'EDITOR' } } },
     });
 
     if (!document) {
-      res.status(404).json({ message: 'Dokumen tidak ditemukan.' });
+      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      res.status(404).json({ success: false, message: 'Document not found' });
       return;
     }
 
-    if (!canModifyDocument(req.user!.role, req.user!.userId, document.folder.owner_id)) {
-      res.status(403).json({ message: 'Anda tidak memiliki izin untuk mengunggah versi baru dokumen ini.' });
+    const hasEditAccess = document.uploadedBy === userId || document.shares.length > 0;
+    if (!hasEditAccess) {
+      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      res.status(403).json({ success: false, message: 'Access denied. EDITOR access required.' });
       return;
     }
 
-    const newVersionNumber = document.current_version + 1;
-    const placeholderKey = `pending-upload/${crypto.randomUUID()}.${extension || document.extension}`;
+    const newVersion = document.currentVersion + 1;
 
-    const updatedDocument = await prisma.$transaction(async (tx) => {
-      await tx.documentVersion.create({
-        data: {
-          document_id: id,
-          version_number: newVersionNumber,
-          s3_file_key: placeholderKey,
-          uploaded_by: req.user!.userId,
-          changelog: changelog || null,
-        },
-      });
-
-      return tx.document.update({
-        where: { id },
-        data: {
-          current_version: newVersionNumber,
-          size_bytes: BigInt(size_bytes),
-          extension: extension || document.extension,
-          status: 'PENDING_REVIEW',
-        },
-      });
-    });
-
-    await logActivity({
-        userId: req.user!.userId,
-        action: 'UPLOAD_VERSION',
-        details: `Mengunggah versi baru (v${newVersionNumber}) untuk dokumen "${document.title}" (ID: ${id})`,
-        ipAddress: getClientIp(req),
-        });
-
-    res.status(201).json({
-      message: `Versi baru (v${newVersionNumber}) berhasil ditambahkan.`,
-      document: { ...updatedDocument, size_bytes: updatedDocument.size_bytes.toString() },
-    });
-  } catch (error) {
-    console.error('Upload New Version Error:', error);
-    res.status(500).json({ message: 'Terjadi kegagalan server saat mengunggah versi baru.' });
-  }
-};
-
-// 5. FUNGSI MELIHAT RIWAYAT VERSI — DIPERBARUI dengan pengecekan yang sama seperti getDocumentById
-export const getVersionHistory = async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const { id } = req.params as { id: string };
-
-    const document = await prisma.document.findUnique({
+    const updatedDocument = await prisma.document.update({
       where: { id },
-      include: { folder: true },
+      data: {
+        currentVersion: newVersion,
+        versions: {
+          create: {
+            versionNumber: newVersion,
+            s3FileKey: file.path,
+            uploadedBy: userId,
+            changelog: changelog || 'New version uploaded',
+          },
+        },
+      },
+      include: { versions: { orderBy: { versionNumber: 'desc' }, take: 1 } },
     });
-    if (!document) {
-      res.status(404).json({ message: 'Dokumen tidak ditemukan.' });
-      return;
-    }
 
-    const allowed = await canViewDocument(
-      req.user!.role,
-      req.user!.userId,
-      document.folder.owner_id,
+    await logActivityWithRequest(
+      req,
+      userId,
+      'UPLOAD_VERSION',
+      {
+        title: document.title,
+        fileName: file.originalname,
+        fileSize: file.size,
+        version: newVersion,
+        changelog,
+      },
+      'DOCUMENT',
       document.id
     );
 
-    if (!allowed) {
-      res.status(403).json({ message: 'Anda tidak memiliki izin untuk melihat riwayat dokumen ini.' });
+    res.json({ success: true, message: 'New version uploaded', data: updatedDocument });
+  } catch (error) {
+    console.error('Upload version error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// ============ VERSIONS ============
+export const getDocumentVersions = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const userId = req.user!.id;
+
+    const document = await prisma.document.findFirst({
+      where: {
+        id,
+        OR: [
+          { uploadedBy: userId },
+          {
+            shares: {
+              some: {
+                userId,
+                accessLevel: { in: ['VIEWER', 'DOWNLOADER', 'EDITOR'] },
+              },
+            },
+          },
+        ],
+      },
+    });
+
+    if (!document) {
+      res.status(404).json({ success: false, message: 'Not found or access denied' });
       return;
     }
 
     const versions = await prisma.documentVersion.findMany({
-      where: { document_id: id },
-      orderBy: { version_number: 'desc' },
+      where: { documentId: id },
+      orderBy: { versionNumber: 'desc' },
     });
 
-    res.status(200).json({ documentId: id, versions });
+    res.json({ success: true, data: versions });
   } catch (error) {
-    console.error('Get Version History Error:', error);
-    res.status(500).json({ message: 'Terjadi kegagalan server saat mengambil riwayat versi.' });
+    console.error('Get versions error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
+export const getVersionHistory = getDocumentVersions;
 
+// ============ DELETE ============
 export const deleteDocument = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { id } = req.params as { id: string };
+    const id = req.params.id as string;
+    const userId = req.user!.id;
 
-    const document = await prisma.document.findUnique({
-      where: { id },
-      include: { folder: true },
-    });
-
+    const document = await prisma.document.findUnique({ where: { id } });
     if (!document) {
-      res.status(404).json({ message: 'Dokumen tidak ditemukan.' });
+      res.status(404).json({ success: false, message: 'Document not found' });
       return;
     }
 
-    if (!canModifyDocument(req.user!.role, req.user!.userId, document.folder.owner_id)) {
-      res.status(403).json({ message: 'Anda tidak memiliki izin untuk menghapus dokumen ini.' });
-      return;
+    const versions = await prisma.documentVersion.findMany({ where: { documentId: id } });
+    for (const v of versions) {
+      if (v.s3FileKey && fs.existsSync(v.s3FileKey)) {
+        try {
+          fs.unlinkSync(v.s3FileKey);
+        } catch (e) {
+          console.error('Failed to delete file:', v.s3FileKey, e);
+        }
+      }
     }
-
-    await logActivity({
-        userId: req.user!.userId,
-        action: 'DELETE_DOCUMENT',
-        details: `Menghapus dokumen "${document.title}" (ID: ${id})`,
-        ipAddress: getClientIp(req),
-        });
 
     await prisma.document.delete({ where: { id } });
 
-    res.status(200).json({ message: 'Dokumen berhasil dihapus.' });
+    await logActivityWithRequest(
+      req,
+      userId,
+      'DELETE_DOCUMENT',
+      { title: document.title },
+      'DOCUMENT',
+      id
+    );
+
+    res.json({ success: true, message: 'Document deleted successfully' });
   } catch (error) {
-    console.error('Delete Document Error:', error);
-    res.status(500).json({ message: 'Terjadi kegagalan server saat menghapus dokumen.' });
+    console.error('Delete document error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
+
+// ============ ALIAS untuk routes lama ============
+export const createDocument = uploadDocument;
+export const getDocumentById = getDocumentDetail;

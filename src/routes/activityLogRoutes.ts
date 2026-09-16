@@ -1,14 +1,25 @@
 import { Router } from 'express';
-import { getActivityLogs, exportActivityLogsCsv } from '../controllers/activityLogController.js';
+import { ActivityLogController } from '../controllers/activityLogController.js';
 import { verifyToken } from '../middlewares/verifyToken.js';
-import { validateQuery } from '../middlewares/validate.js';
-import { activityLogQuerySchema } from '../schemas/activityLogSchemas.js';
+import { checkRole } from '../middlewares/checkRole.js';
 
 const router = Router();
 
 router.use(verifyToken);
 
-router.get('/', validateQuery(activityLogQuerySchema), getActivityLogs);
-router.get('/export', exportActivityLogsCsv);
+router.get('/me', ActivityLogController.getMyActivity);
+router.get('/stats', ActivityLogController.getStats);
+
+router.get(
+  '/export',
+  checkRole('SUPER_ADMIN', 'AUDITOR'),
+  ActivityLogController.exportCsv
+);
+
+router.get(
+  '/',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN'),
+  ActivityLogController.getLogs
+);
 
 export default router;

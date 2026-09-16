@@ -1,49 +1,63 @@
-import type { Request, Response, NextFunction } from 'express';
+import type { Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { prisma } from '../config/prisma.js';
+import type { AuthRequest, JwtPayload } from '../types/index.js';
+import { AuthenticationError } from '../utils/errorGuards.js';
 
-const JWT_ACCESS_SECRET = process.env.JWT_ACCESS_SECRET;
-if (!JWT_ACCESS_SECRET) {
-  throw new Error('JWT_ACCESS_SECRET wajib di-set di environment variables.');
-}
-
-export interface AuthRequest extends Request {
-  user?: {
-    userId: string;
-    role: string;
-  };
-}
-
-interface JwtPayload {
-  userId: string;
-  role: string;
-  iat: number;
-  exp: number;
-}
-
-export const verifyToken = (req: AuthRequest, res: Response, next: NextFunction): void => {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ message: 'Token autentikasi tidak ditemukan.' });
-    return;
-  }
-
-  const token = authHeader.split(' ')[1];
-
-  if (!token) {
-    res.status(401).json({ message: 'Token autentikasi tidak valid.' });
-    return;
-  }
-
+export const verifyToken = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) => {
   try {
-    const decoded = jwt.verify(token, JWT_ACCESS_SECRET as string) as unknown as JwtPayload;
-    req.user = { userId: decoded.userId, role: decoded.role };
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      throw new AuthenticationError('No token provided');
+    }
+
+    const token = authHeader.split(' ')[1];
+
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET as string
+    ) as unknown as JwtPayload;
+
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        role: true,
+        companyId: true,
+      },
+    });
+
+    if (!user) {
+      throw new AuthenticationError('User not found');
+    }
+
+    req.user = {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      companyId: user.companyId,
+    };
+
     next();
   } catch (error) {
-    if (error instanceof jwt.TokenExpiredError) {
-      res.status(401).json({ message: 'Sesi telah kedaluwarsa, silakan login kembali.' });
-      return;
+    if (error instanceof AuthenticationError) {
+      return res.status(401).json({ success: false, message: error.message });
     }
-    res.status(401).json({ message: 'Token tidak valid.' });
+    if (error instanceof jwt.TokenExpiredError) {
+      return res.status(401).json({ success: false, message: 'Token expired' });
+    }
+    if (error instanceof jwt.JsonWebTokenError) {
+      return res.status(401).json({ success: false, message: 'Invalid token' });
+    }
+    console.error('Auth error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

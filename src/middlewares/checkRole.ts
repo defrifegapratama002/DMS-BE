@@ -1,18 +1,27 @@
 import type { Response, NextFunction } from 'express';
-import type { AuthRequest } from './verifyToken.js';
+import type { AuthRequest } from '../types/index.js';
+import { AuthorizationError } from '../utils/errorGuards.js';
 
+// Variadic: checkRole('SUPER_ADMIN', 'COMPANY_ADMIN')
 export const checkRole = (...allowedRoles: string[]) => {
-  return (req: AuthRequest, res: Response, next: NextFunction): void => {
-    if (!req.user) {
-      res.status(401).json({ message: 'Autentikasi diperlukan.' });
-      return;
-    }
+  return (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const user = req.user;
 
-    if (!allowedRoles.includes(req.user.role)) {
-      res.status(403).json({ message: 'Anda tidak memiliki izin untuk mengakses sumber daya ini.' });
-      return;
-    }
+      if (!user) {
+        throw new AuthorizationError('User not authenticated');
+      }
 
-    next();
+      if (!allowedRoles.includes(user.role)) {
+        throw new AuthorizationError('Insufficient permissions');
+      }
+
+      next();
+    } catch (error) {
+      if (error instanceof AuthorizationError) {
+        return res.status(403).json({ success: false, message: error.message });
+      }
+      res.status(500).json({ success: false, message: 'Internal server error' });
+    }
   };
 };

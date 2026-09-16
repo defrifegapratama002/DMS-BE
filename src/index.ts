@@ -1,33 +1,55 @@
-import 'dotenv/config';
 import express from 'express';
-import type { Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import dotenv from 'dotenv';
+import { errorHandler } from './middlewares/errorHandler.js';
+import logger from './utils/logger.js';
+
+// Routes
 import authRoutes from './routes/authRoutes.js';
-import folderRoutes from './routes/folderRoutes.js';
 import documentRoutes from './routes/documentRoutes.js';
+import folderRoutes from './routes/folderRoutes.js';
 import shareRoutes from './routes/shareRoutes.js';
 import activityLogRoutes from './routes/activityLogRoutes.js';
 
+dotenv.config();
+
+(BigInt.prototype as any).toJSON = function () {
+  return this.toString();
+};
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(helmet());
-app.use(cors());
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL?.split(',') || 'http://localhost:3000',
+    credentials: true,
+  })
+);
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+app.use('/uploads', express.static(process.env.UPLOAD_DIR || './uploads'));
 
 app.use('/api/auth', authRoutes);
-app.use('/api/folders', folderRoutes);
 app.use('/api/documents', documentRoutes);
+app.use('/api/folders', folderRoutes);
 app.use('/api/shares', shareRoutes);
 app.use('/api/activity-logs', activityLogRoutes);
 
-app.get('/', (req: Request, res: Response) => {
-  res.json({ message: 'SecureDMS Backend API Running Securely' });
+app.get('/healthz', (req, res) => {
+  res.json({
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+  });
 });
 
+app.use(errorHandler);
+
 app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-console.log(`🚀 Server berjalan dengan aman pada URL http://localhost:${PORT}`);
+  logger.info(`🚀 DMS Backend running on http://localhost:${PORT}`);
+  logger.info(`📊 Environment: ${process.env.NODE_ENV}`);
 });

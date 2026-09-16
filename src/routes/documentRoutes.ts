@@ -1,26 +1,51 @@
 import { Router } from 'express';
 import {
-  createDocument,
-  getDocumentById,
-  renameDocument,
+  getDocuments,
+  uploadDocument,
+  getDocumentDetail,
+  updateDocument,
   uploadNewVersion,
-  getVersionHistory,
+  getDocumentVersions,
   deleteDocument,
 } from '../controllers/documentController.js';
 import { verifyToken } from '../middlewares/verifyToken.js';
 import { checkRole } from '../middlewares/checkRole.js';
-import { validateBody } from '../middlewares/validate.js';
-import { createDocumentSchema, renameDocumentSchema, uploadVersionSchema } from '../schemas/documentSchemas.js';
+import { upload } from '../middlewares/upload.js';
 
 const router = Router();
 
 router.use(verifyToken);
 
-router.post('/', checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'), validateBody(createDocumentSchema), createDocument);
-router.get('/:id', checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'AUDITOR', 'EMPLOYEE'), getDocumentById);
-router.patch('/:id/rename', checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'), validateBody(renameDocumentSchema), renameDocument);
-router.post('/:id/versions', checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'), validateBody(uploadVersionSchema), uploadNewVersion);
-router.get('/:id/versions', checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'AUDITOR', 'EMPLOYEE'), getVersionHistory);
-router.delete('/:id', checkRole('SUPER_ADMIN', 'COMPANY_ADMIN'), deleteDocument);
+router.get('/', getDocuments);
+
+router.post(
+  '/',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
+  upload.single('file'),
+  uploadDocument
+);
+
+router.get('/:id', getDocumentDetail);
+
+router.patch(
+  '/:id',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
+  updateDocument
+);
+
+router.post(
+  '/:id/versions',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
+  upload.single('file'),
+  uploadNewVersion
+);
+
+router.get('/:id/versions', getDocumentVersions);
+
+router.delete(
+  '/:id',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN'),
+  deleteDocument
+);
 
 export default router;

@@ -1,259 +1,348 @@
 import type { Request, Response } from 'express';
 import bcrypt from 'bcrypt';
-import jwt from 'jsonwebtoken';
-import crypto from 'crypto';
+import jwt, { type SignOptions } from 'jsonwebtoken';
 import { prisma } from '../config/prisma.js';
-import { logActivity, getClientIp } from '../utils/activityLogger.js';
-import { isPrismaKnownError } from '../utils/errorGuards.js';
+import { logActivityWithRequest } from '../utils/activityLogger.js';
+import { AppError } from '../utils/errorGuards.js';
+import type { AuthRequest } from '../types/index.js';
+import { z } from 'zod';
 
-const JWT_ACCESS_SECRET = process.env.JWT_ACCESS_SECRET;
-const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
+const SALT_ROUNDS = parseInt(process.env.BCRYPT_SALT_ROUNDS || '10');
 
-if (!JWT_ACCESS_SECRET || !JWT_REFRESH_SECRET) {
-  throw new Error('JWT_ACCESS_SECRET dan JWT_REFRESH_SECRET wajib di-set di environment variables.');
-}
+const registerSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+  name: z.string().min(2),
+  role: z
+    .enum(['SUPER_ADMIN', 'COMPANY_ADMIN', 'AUDITOR', 'EMPLOYEE'])
+    .optional(),
+  companyId: z.string().uuid().optional(),
+});
 
-const ACCESS_TOKEN_TTL = '15m';
-const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 hari
+const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string(),
+});
 
-// Helper: hash refresh token sebelum disimpan ke database (jangan pernah simpan token mentah)
-function hashToken(token: string): string {
-  return crypto.createHash('sha256').update(token).digest('hex');
-}
+const refreshTokenSchema = z.object({
+  refreshToken: z.string(),
+});
 
-// Helper: generate pasangan access token + refresh token, dan simpan refresh token (hashed) ke DB
-async function issueTokenPair(userId: string, role: string) {
-  const accessToken = jwt.sign({ userId, role }, JWT_ACCESS_SECRET as string, {
-    expiresIn: ACCESS_TOKEN_TTL,
-  });
+const generateAccessToken = (userId: string): string => {
+  const secret = process.env.JWT_SECRET as string;
+  const options: SignOptions = {
+    expiresIn: (process.env.JWT_ACCESS_EXPIRES_IN || '15m') as any,
+  };
+  return jwt.sign({ userId, type: 'access' }, secret, options);
+};
 
-  const rawRefreshToken = crypto.randomBytes(40).toString('hex');
-  // userId disertakan juga di payload refresh token supaya bisa dipakai
-  // saat logout (mencatat siapa yang logout) tanpa perlu query tambahan.
-  const refreshTokenJwt = jwt.sign(
-    { userId, jti: rawRefreshToken },
-    JWT_REFRESH_SECRET as string,
-    { expiresIn: '7d' }
-  );
+const generateRefreshToken = async (userId: string): Promise<string> => {
+  const secret = process.env.JWT_REFRESH_SECRET as string;
+  const options: SignOptions = {
+    expiresIn: (process.env.JWT_REFRESH_EXPIRES_IN || '7d') as any,
+  };
+  const token = jwt.sign({ userId, type: 'refresh' }, secret, options);
+
+  const tokenHash = await bcrypt.hash(token, 10);
 
   await prisma.refreshToken.create({
     data: {
-      user_id: userId,
-      token_hash: hashToken(rawRefreshToken),
-      expires_at: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+      userId,
+      tokenHash,
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
     },
   });
 
-  return { accessToken, refreshToken: refreshTokenJwt };
-}
+  return token;
+};
 
-// 1. FUNGSI REGISTER USER
-export const register = async (req: Request, res: Response): Promise<void> => {
+export const register = async (req: Request, res: Response) => {
   try {
-    const { email, password, name } = req.body; // sudah tervalidasi & ter-trim oleh middleware
+    const validated = registerSchema.parse(req.body);
 
-    const saltRounds = 10;
-    const passwordHash = await bcrypt.hash(password, saltRounds);
+    const existingUser = await prisma.user.findUnique({
+      where: { email: validated.email },
+    });
 
-    const newUser = await prisma.user.create({
+    if (existingUser) {
+      throw new AppError('User already exists', 400);
+    }
+
+    const hashedPassword = await bcrypt.hash(validated.password, SALT_ROUNDS);
+
+    const user = await prisma.user.create({
       data: {
-        email,
-        name,
-        password_hash: passwordHash,  
-        role: 'EMPLOYEE',
+        email: validated.email,
+        passwordHash: hashedPassword,   // ✅ passwordHash
+        name: validated.name,
+        role: validated.role || 'EMPLOYEE',
+        companyId: validated.companyId || null,
       },
       select: {
         id: true,
         email: true,
         name: true,
         role: true,
-        created_at: true,
+        companyId: true,
+        createdAt: true,
       },
     });
 
+    await logActivityWithRequest(
+      req,
+      user.id,
+      'REGISTER',
+      { email: user.email },
+      'USER',
+      user.id
+    );
+
+    const accessToken = generateAccessToken(user.id);
+    const refreshToken = await generateRefreshToken(user.id);
+
     res.status(201).json({
-      message: 'Registrasi akun berhasil dilakukan.',
-      user: newUser,
+      success: true,
+      message: 'User created successfully',
+      data: { user, accessToken, refreshToken },
     });
-    } catch (error) {
-    if (isPrismaKnownError(error) && error.code === 'P2002') {
-      res.status(409).json({ message: 'Email tersebut sudah terdaftar di sistem.' });
-      return;
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation error',
+        errors: error.issues,   // ✅ .issues
+      });
     }
-    console.error('Register Error:', error);
-    res.status(500).json({ message: 'Terjadi kegagalan server saat melakukan registrasi.' });
+    if (error instanceof AppError) {
+      return res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+      });
+    }
+    console.error('Register error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
-// 2. FUNGSI LOGIN USER
-export const login = async (req: Request, res: Response): Promise<void> => {
+export const login = async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    const validated = loginSchema.parse(req.body);
 
-    if (!email || !password) {
-      res.status(400).json({ message: 'Email dan password wajib diisi.' });
-      return;
-    }
-
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) {
-      res.status(401).json({ message: 'Kombinasi email atau password salah.' });
-      return;
-    }
-
-    const isPasswordValid = await bcrypt.compare(password, user.password_hash);
-
-    // PERBAIKAN: logActivity dan res.status sekarang benar-benar berada
-    // di dalam satu blok yang sama, hanya jalan kalau password memang salah.
-    if (!isPasswordValid) {
-      await logActivity({
-        userId: user.id,
-        action: 'LOGIN_FAILED',
-        details: `Percobaan login gagal untuk email ${email}`,
-        ipAddress: getClientIp(req),
-      });
-      res.status(401).json({ message: 'Kombinasi email atau password salah.' });
-      return;
-    }
-
-    const { accessToken, refreshToken } = await issueTokenPair(user.id, user.role);
-
-    await logActivity({
-      userId: user.id,
-      action: 'LOGIN',
-      details: `Login berhasil dari email ${email}`,
-      ipAddress: getClientIp(req),
+    const user = await prisma.user.findUnique({
+      where: { email: validated.email },
+      include: { company: true },
     });
 
-    res.status(200).json({
-      message: 'Autentikasi login berhasil.',
-      accessToken,
-      refreshToken,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        role: user.role,
+    if (!user) {
+      throw new AppError('Invalid credentials', 401);
+    }
+
+    const isValidPassword = await bcrypt.compare(
+      validated.password,
+      user.passwordHash    // ✅ passwordHash
+    );
+
+    if (!isValidPassword) {
+      throw new AppError('Invalid credentials', 401);
+    }
+
+    const accessToken = generateAccessToken(user.id);
+    const refreshToken = await generateRefreshToken(user.id);
+
+    // Update last login
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { lastLoginAt: new Date() },
+    });
+
+    await logActivityWithRequest(
+      req,
+      user.id,
+      'LOGIN',
+      { email: user.email, company: user.company?.name },
+      'USER',
+      user.id
+    );
+
+    res.json({
+      success: true,
+      message: 'Login successful',
+      data: {
+        user: {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          role: user.role,
+          company: user.company,
+        },
+        accessToken,
+        refreshToken,
       },
     });
   } catch (error) {
-    console.error('Login Error:', error);
-    res.status(500).json({ message: 'Terjadi kegagalan server saat melakukan proses login.' });
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation error',
+        errors: error.issues,
+      });
+    }
+    if (error instanceof AppError) {
+      return res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+      });
+    }
+    console.error('Login error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
-// 3. FUNGSI REFRESH TOKEN (ROTATION)
-export const refreshAccessToken = async (req: Request, res: Response): Promise<void> => {
+export const refreshToken = async (req: Request, res: Response) => {
   try {
-    const { refreshToken } = req.body;
+    const validated = refreshTokenSchema.parse(req.body);
+    const { refreshToken: incomingToken } = validated;
 
-    if (!refreshToken || typeof refreshToken !== 'string') {
-      res.status(401).json({ message: 'Refresh token tidak ditemukan.' });
-      return;
-    }
+    const decoded = jwt.verify(
+      incomingToken,
+      process.env.JWT_REFRESH_SECRET as string
+    ) as unknown as { userId: string };
 
-    let payload: { userId: string; jti: string };
-    try {
-      payload = jwt.verify(refreshToken, JWT_REFRESH_SECRET as string) as unknown as {
-        userId: string;
-        jti: string;
-      };
-    } catch {
-      res.status(401).json({ message: 'Refresh token tidak valid atau kedaluwarsa.' });
-      return;
-    }
-
-    const tokenHash = hashToken(payload.jti);
-    const storedToken = await prisma.refreshToken.findUnique({
-      where: { token_hash: tokenHash },
+    const tokenHash = await bcrypt.hash(incomingToken, 10);
+    const storedToken = await prisma.refreshToken.findFirst({
+      where: {
+        userId: decoded.userId,
+        tokenHash,
+        expiresAt: { gt: new Date() },
+        revokedAt: null,
+      },
     });
 
     if (!storedToken) {
-      res.status(401).json({ message: 'Refresh token tidak dikenali.' });
-      return;
+      throw new AppError('Invalid or expired refresh token', 401);
     }
 
-    // Reuse detection: token yang sudah di-revoke tapi dipakai lagi = indikasi pencurian.
-    // Cabut seluruh refresh token milik user ini sebagai tindakan pengamanan.
-    if (storedToken.revoked_at) {
+    if (storedToken.replacedBy) {
       await prisma.refreshToken.updateMany({
-        where: { user_id: storedToken.user_id, revoked_at: null },
-        data: { revoked_at: new Date() },
+        where: { userId: decoded.userId },
+        data: { revokedAt: new Date() },
       });
-      res.status(401).json({
-        message: 'Terdeteksi penggunaan token yang tidak sah. Silakan login kembali.',
-      });
-      return;
+      throw new AppError('Token reuse detected - all tokens revoked', 401);
     }
 
-    if (storedToken.expires_at < new Date()) {
-      res.status(401).json({ message: 'Refresh token telah kedaluwarsa. Silakan login kembali.' });
-      return;
-    }
-
-    const user = await prisma.user.findUnique({ where: { id: storedToken.user_id } });
-    if (!user) {
-      res.status(401).json({ message: 'Pengguna tidak ditemukan.' });
-      return;
-    }
-
-    // Cabut token lama, terbitkan pasangan token baru (rotation)
-    const { accessToken, refreshToken: newRefreshToken } = await issueTokenPair(user.id, user.role);
+    const newAccessToken = generateAccessToken(decoded.userId);
+    const newRefreshToken = await generateRefreshToken(decoded.userId);
 
     await prisma.refreshToken.update({
       where: { id: storedToken.id },
-      data: { revoked_at: new Date() },
+      data: { replacedBy: newRefreshToken },
     });
 
-    res.status(200).json({
-      message: 'Token berhasil diperbarui.',
-      accessToken,
-      refreshToken: newRefreshToken,
+    res.json({
+      success: true,
+      data: { accessToken: newAccessToken, refreshToken: newRefreshToken },
     });
   } catch (error) {
-    console.error('Refresh Token Error:', error);
-    res.status(500).json({ message: 'Terjadi kegagalan server saat memperbarui token.' });
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation error',
+        errors: error.issues,
+      });
+    }
+    if (error instanceof jwt.TokenExpiredError) {
+      return res.status(401).json({
+        success: false,
+        message: 'Refresh token expired',
+      });
+    }
+    if (error instanceof jwt.JsonWebTokenError) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid refresh token',
+      });
+    }
+    if (error instanceof AppError) {
+      return res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+      });
+    }
+    console.error('Refresh token error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
-// 4. FUNGSI LOGOUT (REVOKE REFRESH TOKEN)
-export const logout = async (req: Request, res: Response): Promise<void> => {
+export const logout = async (req: Request, res: Response) => {
   try {
-    const { refreshToken } = req.body;
+    const userId = (req as AuthRequest).user?.id;
+    const { refreshToken: incomingToken } = req.body;
 
-    if (!refreshToken || typeof refreshToken !== 'string') {
-      res.status(400).json({ message: 'Refresh token wajib disertakan untuk logout.' });
-      return;
+    if (incomingToken && userId) {
+      const tokenHash = await bcrypt.hash(incomingToken, 10);
+      await prisma.refreshToken.updateMany({
+        where: { userId, tokenHash, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
     }
 
-    let payload: { userId: string; jti: string };
-    try {
-      payload = jwt.verify(refreshToken, JWT_REFRESH_SECRET as string) as unknown as {
-        userId: string;
-        jti: string;
-      };
-    } catch {
-      // Token sudah tidak valid pun tetap dianggap "berhasil logout" dari sisi klien
-      res.status(200).json({ message: 'Logout berhasil.' });
-      return;
+    if (userId) {
+      await logActivityWithRequest(req, userId, 'LOGOUT', {}, 'USER', userId);
     }
 
-    const tokenHash = hashToken(payload.jti);
-    await prisma.refreshToken.updateMany({
-      where: { token_hash: tokenHash, revoked_at: null },
-      data: { revoked_at: new Date() },
-    });
-
-    await logActivity({
-      userId: payload.userId,
-      action: 'LOGOUT',
-      details: 'User logout dan mencabut refresh token.',
-      ipAddress: getClientIp(req),
-    });
-
-    res.status(200).json({ message: 'Logout berhasil.' });
+    res.json({ success: true, message: 'Logged out successfully' });
   } catch (error) {
-    console.error('Logout Error:', error);
-    res.status(500).json({ message: 'Terjadi kegagalan server saat logout.' });
+    console.error('Logout error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+export const getCurrentUser = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthRequest).user?.id;
+
+    if (!userId) {
+      throw new AppError('User not authenticated', 401);
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        role: true,
+        companyId: true,
+        active: true,
+        lastLoginAt: true,
+        company: {
+          select: { id: true, name: true, domain: true },
+        },
+        createdAt: true,
+        _count: {
+          select: {
+            folders: true,
+            documents: true,
+            shares: true,
+            logs: true,
+          },
+        },
+      },
+    });
+
+    if (!user) {
+      throw new AppError('User not found', 404);
+    }
+
+    res.json({ success: true, data: user });
+  } catch (error) {
+    if (error instanceof AppError) {
+      return res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+      });
+    }
+    console.error('Get user error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

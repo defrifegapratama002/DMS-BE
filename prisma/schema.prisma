@@ -1,6 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -9,58 +6,12 @@ datasource db {
   provider = "postgresql"
 }
 
-// 1. Tabel Pengguna (Users)
-model User {
-  id            String         @id @default(uuid())
-  email         String         @unique
-  password_hash String
-  name          String
-  role          SystemRole     @default(EMPLOYEE)
-  created_at    DateTime       @default(now())
-  updated_at    DateTime       @updatedAt
-  DocumentShare DocumentShare[]
-  ActivityLog   ActivityLog[]
-  RefreshToken  RefreshToken[]
-  Folder        Folder[]
-}
-
+// ============ ENUMS ============
 enum SystemRole {
   SUPER_ADMIN
   COMPANY_ADMIN
   AUDITOR
   EMPLOYEE
-}
-
-// 2. Tabel Folder (Self-Referencing untuk Struktur Folder Tak Terbatas)
-model Folder {
-  id                String         @id @default(uuid())
-  name              String
-  owner_id          String
-  owner             User           @relation(fields: [owner_id], references: [id])
-  parent_folder_id  String?
-  parent_folder     Folder?        @relation("FolderToFolder", fields: [parent_folder_id], references: [id], onDelete: Cascade)
-  sub_folders       Folder[]       @relation("FolderToFolder")
-  documents         Document[]
-  created_at        DateTime       @default(now())
-  updated_at        DateTime       @updatedAt
-
-  @@index([owner_id])
-}
-
-// 3. Tabel Dokumen / Berkas Utama
-model Document {
-  id          String            @id @default(uuid())
-  title       String
-  extension   String            // pdf, docx, xlsx, png, dll
-  size_bytes  BigInt
-  folder_id   String
-  folder      Folder            @relation(fields: [folder_id], references: [id])
-  current_version Int           @default(1)
-  status      DocumentStatus    @default(DRAFT)
-  versions    DocumentVersion[]
-  shares      DocumentShare[]
-  created_at  DateTime          @default(now())
-  updated_at  DateTime          @updatedAt
 }
 
 enum DocumentStatus {
@@ -70,55 +21,251 @@ enum DocumentStatus {
   ARCHIVED
 }
 
-// 4. Tabel Versi Dokumen (Version Control System)
+enum AccessLevel {
+  VIEWER
+  DOWNLOADER
+  EDITOR
+}
+
+// ============ MODELS ============
+model User {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  passwordHash String     @map("password_hash")
+  name         String
+  role         SystemRole @default(EMPLOYEE)
+  companyId    String?    @map("company_id")
+  active       Boolean    @default(true)
+  lastLoginAt  DateTime?  @map("last_login_at")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+
+  company       Company?          @relation(fields: [companyId], references: [id])
+  folders       Folder[]
+  documents     Document[]        @relation("DocumentUploadedBy")
+  versions      DocumentVersion[] @relation("VersionUploadedBy")
+  shares        DocumentShare[]
+  logs          ActivityLog[]
+  refreshTokens RefreshToken[]
+  documentNotes DocumentNote[]
+
+  @@map("users")
+}
+
+model Company {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  domain    String?  @unique
+  logoUrl   String?  @map("logo_url")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  users User[]
+
+  @@map("companies")
+}
+
+model Folder {
+  id             String   @id @default(uuid())
+  name           String
+  description    String?
+  ownerId        String   @map("owner_id")
+  parentFolderId String?  @map("parent_folder_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  owner        User       @relation(fields: [ownerId], references: [id])
+  parentFolder Folder?    @relation("FolderHierarchy", fields: [parentFolderId], references: [id], onDelete: Cascade)
+  subFolders   Folder[]   @relation("FolderHierarchy")
+  documents    Document[]
+
+  @@index([ownerId])
+  @@index([parentFolderId])
+  @@map("folders")
+}
+
+model Document {
+  id             String         @id @default(uuid())
+  title          String
+  description    String?
+  extension      String
+  sizeBytes      BigInt         @map("size_bytes")
+  folderId       String         @map("folder_id")
+  uploadedBy     String         @map("uploaded_by")
+  currentVersion Int            @default(1) @map("current_version")
+  status         DocumentStatus @default(DRAFT)
+  isPublic       Boolean        @default(false) @map("is_public")
+
+  // Batch 1 additions
+  deletedAt       DateTime? @map("deleted_at")
+  documentTypeId  String?   @map("document_type_id")
+  correspondentId String?   @map("correspondent_id")
+  documentDate    DateTime? @map("document_date")
+  asn             String?   @unique
+  customFields    Json?     @default("{}") @map("custom_fields")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  folder         Folder            @relation(fields: [folderId], references: [id])
+  uploadedByUser User              @relation("DocumentUploadedBy", fields: [uploadedBy], references: [id])
+  documentType   DocumentType?     @relation(fields: [documentTypeId], references: [id])
+  correspondent  Correspondent?    @relation(fields: [correspondentId], references: [id])
+  versions       DocumentVersion[]
+  shares         DocumentShare[]
+  documentTags   DocumentTag[]
+  notes          DocumentNote[]
+  activityLogs   ActivityLog[]
+
+  @@index([folderId])
+  @@index([uploadedBy])
+  @@index([deletedAt])
+  @@map("documents")
+}
+
 model DocumentVersion {
   id            String   @id @default(uuid())
-  document_id   String
-  document      Document @relation(fields: [document_id], references: [id], onDelete: Cascade)
-  version_number Int
-  s3_file_key   String   // Path lokasi file aman di Object Storage (S3)
-  uploaded_by   String
-  changelog     String?  // Catatan perubahan dokumen (misal: "Revisi pasal 4")
-  created_at    DateTime @default(now())
+  documentId    String   @map("document_id")
+  versionNumber Int      @map("version_number")
+  s3FileKey     String   @map("s3_file_key")
+  fileSize      BigInt?  @map("file_size")
+  mimeType      String?  @map("mime_type")
+  uploadedBy    String   @map("uploaded_by")
+  changelog     String?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  document       Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  uploadedByUser User     @relation("VersionUploadedBy", fields: [uploadedBy], references: [id])
+
+  @@unique([documentId, versionNumber])
+  @@index([documentId])
+  @@index([uploadedBy])
+  @@map("document_versions")
 }
 
-// 5. Tabel Hak Akses Berbagi Berkas (Granular Access Control)
 model DocumentShare {
   id          String      @id @default(uuid())
-  document_id String
-  document    Document    @relation(fields: [document_id], references: [id], onDelete: Cascade)
-  user_id     String
-  user        User        @relation(fields: [user_id], references: [id], onDelete: Cascade)
-  access_level AccessLevel @default(VIEWER)
-  created_at  DateTime    @default(now())
+  documentId  String      @map("document_id")
+  userId      String      @map("user_id")
+  accessLevel AccessLevel @default(VIEWER) @map("access_level")
+  sharedBy    String      @map("shared_by")
+  expiresAt   DateTime?   @map("expires_at")
+  createdAt   DateTime    @default(now()) @map("created_at")
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, userId])
+  @@index([documentId])
+  @@index([userId])
+  @@map("document_shares")
 }
 
-enum AccessLevel {
-  VIEWER       // Hanya pratinjau, tombol unduh mati
-  DOWNLOADER   // Bisa lihat dan unduh berkas asli
-  EDITOR       // Bisa unggah versi baru dan edit judul
+// ============ BATCH 1: METADATA ============
+model Tag {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  color     String   @default("#6B7280")
+  createdBy String?  @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  documents DocumentTag[]
+
+  @@map("tags")
 }
 
-// 6. Tabel Audit Log (Melacak kepatuhan aktivitas pengguna)
-model ActivityLog {
+model DocumentTag {
+  documentId String   @map("document_id")
+  tagId      String   @map("tag_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  tag      Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([documentId, tagId])
+  @@index([tagId])
+  @@map("document_tags")
+}
+
+model DocumentType {
   id          String   @id @default(uuid())
-  user_id     String
-  user        User     @relation(fields: [user_id], references: [id])
-  action      String   // DOWNLOAD, VIEW, UPLOAD_REVISION, DELETE, SHARE
-  details     String   // Detail aktivitas log
-  ip_address  String
-  created_at  DateTime @default(now())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  documents Document[]
+
+  @@map("document_types")
+}
+
+model Correspondent {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  email     String?
+  phone     String?
+  address   String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  documents Document[]
+
+  @@map("correspondents")
+}
+
+model DocumentNote {
+  id         String   @id @default(uuid())
+  documentId String   @map("document_id")
+  userId     String   @map("user_id")
+  body       String
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@index([userId])
+  @@map("document_notes")
+}
+
+// ============ ACTIVITY & AUTH ============
+model ActivityLog {
+  id         String   @id @default(uuid())
+  userId     String   @map("user_id")
+  action     String
+  entityType String?  @map("entity_type")
+  entityId   String?  @map("entity_id")
+  documentId String?  @map("document_id")
+  details    String?
+  ipAddress  String   @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user     User      @relation(fields: [userId], references: [id])
+  document Document? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@index([entityType, entityId])
+  @@index([documentId])
+  @@map("activity_logs")
 }
 
 model RefreshToken {
-  id          String    @id @default(uuid())
-  user_id     String
-  user        User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
-  token_hash  String    @unique
-  expires_at  DateTime
-  revoked_at  DateTime?
-  replaced_by String?   // menyimpan id token pengganti (untuk reuse detection)
-  created_at  DateTime  @default(now())
+  id         String    @id @default(uuid())
+  userId     String    @map("user_id")
+  tokenHash  String    @unique @map("token_hash")
+  expiresAt  DateTime  @map("expires_at")
+  revokedAt  DateTime? @map("revoked_at")
+  replacedBy String?   @map("replaced_by")
+  createdAt  DateTime  @default(now()) @map("created_at")
 
-  @@index([user_id])
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
 }
