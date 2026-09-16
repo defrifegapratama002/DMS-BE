@@ -5,6 +5,11 @@ import fs from 'fs';
 import path from 'path';
 import type { AuthRequest } from '../types/index.js';
 import { logActivityWithRequest } from '../utils/activityLogger.js';
+import {
+  validateTransition,
+  getActionForTransition,
+  type DocumentStatus,
+} from '../lib/workflow.js';
 
 // ============ Validation ============
 const createDocumentSchema = z.object({
@@ -16,9 +21,7 @@ const createDocumentSchema = z.object({
 const updateDocumentSchema = z.object({
   title: z.string().min(1).optional(),
   description: z.string().optional(),
-  status: z
-    .enum(['DRAFT', 'PENDING_REVIEW', 'APPROVED', 'ARCHIVED'])
-    .optional(),
+  // ✅ `status` dihapus — ubah status HARUS lewat PATCH /:id/status
 });
 
 // ============ GET ALL (exclude trash) ============
@@ -31,7 +34,7 @@ export const getDocuments = async (
     const { folderId, search, status, page = 1, limit = 10 } = req.query;
 
     const where: any = {
-      deletedAt: null, // ✅ Exclude trashed documents
+      deletedAt: null,
     };
 
     if (folderId) where.folderId = folderId as string;
@@ -203,7 +206,6 @@ export const getDocumentDetail = async (
         shares: {
           include: { user: { select: { id: true, name: true, email: true } } },
         },
-        // ✅ TAMBAH 3 INCLUDE INI
         documentType: true,
         correspondent: true,
         documentTags: { include: { tag: true } },
@@ -225,7 +227,9 @@ export const getDocumentDetail = async (
 
     const userShare = document.shares.find((s) => s.userId === userId);
     const hasAccess =
-      document.uploadedBy === userId || userShare || document.status === 'APPROVED';
+      document.uploadedBy === userId ||
+      userShare ||
+      document.status === 'APPROVED';
 
     if (!hasAccess) {
       res.status(403).json({ success: false, message: 'Access denied' });
@@ -273,7 +277,6 @@ export const updateDocument = async (
       return;
     }
 
-    // ✅ Tidak bisa update dokumen di trash
     if (existing.deletedAt) {
       res.status(400).json({
         success: false,
@@ -350,7 +353,6 @@ export const uploadNewVersion = async (
       return;
     }
 
-    // ✅ Tidak bisa upload versi baru ke dokumen di trash
     if (document.deletedAt) {
       if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
       res.status(400).json({
@@ -427,7 +429,7 @@ export const getDocumentVersions = async (
     const document = await prisma.document.findFirst({
       where: {
         id,
-        deletedAt: null, // ✅ Exclude trashed
+        deletedAt: null,
         OR: [
           { uploadedBy: userId },
           {
@@ -484,7 +486,6 @@ export const deleteDocument = async (
       return;
     }
 
-    // Soft delete: set deletedAt
     await prisma.document.update({
       where: { id },
       data: { deletedAt: new Date() },
@@ -594,7 +595,6 @@ export const purgeDocument = async (
       return;
     }
 
-    // Hanya bisa purge dokumen yang ada di trash
     if (!document.deletedAt) {
       res.status(400).json({
         success: false,
@@ -603,7 +603,6 @@ export const purgeDocument = async (
       return;
     }
 
-    // Delete physical files
     for (const v of document.versions) {
       if (v.s3FileKey && fs.existsSync(v.s3FileKey)) {
         try {
@@ -614,7 +613,6 @@ export const purgeDocument = async (
       }
     }
 
-    // Cascade delete (versions, shares, documentTags, notes)
     await prisma.document.delete({ where: { id } });
 
     await logActivityWithRequest(
@@ -649,7 +647,6 @@ export const emptyTrash = async (
       include: { versions: true },
     });
 
-    // Delete all physical files
     for (const doc of documents) {
       for (const v of doc.versions) {
         if (v.s3FileKey && fs.existsSync(v.s3FileKey)) {
@@ -662,7 +659,6 @@ export const emptyTrash = async (
       }
     }
 
-    // Delete from DB
     await prisma.document.deleteMany({
       where: { id: { in: documents.map((d) => d.id) } },
     });
@@ -682,6 +678,97 @@ export const emptyTrash = async (
     });
   } catch (error) {
     console.error('Empty trash error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// ============ UPDATE STATUS (workflow) ============
+export const updateDocumentStatus = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const userId = req.user!.id;
+    const userRole = req.user!.role;
+    const { status: newStatus, reason } = req.body;
+
+    if (!newStatus) {
+      res.status(400).json({ success: false, message: 'status wajib diisi' });
+      return;
+    }
+
+    const document = await prisma.document.findUnique({ where: { id } });
+    if (!document) {
+      res.status(404).json({ success: false, message: 'Document not found' });
+      return;
+    }
+
+    if (document.deletedAt) {
+      res.status(400).json({
+        success: false,
+        message: 'Tidak bisa ubah status dokumen di trash',
+      });
+      return;
+    }
+
+    const currentStatus = document.status as DocumentStatus;
+    const targetStatus = newStatus as DocumentStatus;
+
+    const action = getActionForTransition(currentStatus, targetStatus, {
+    userId,
+    userRole,
+    documentOwnerId: document.uploadedBy,
+    hasReason: !!(reason && reason.trim()),
+  });
+    if (!action) {
+      res.status(400).json({
+        success: false,
+        message: `Transisi dari ${currentStatus} ke ${targetStatus} tidak valid`,
+      });
+      return;
+    }
+
+    const validation = validateTransition({
+      action,
+      currentStatus,
+      userRole,
+      userId,
+      documentOwnerId: document.uploadedBy,
+      reason,
+    });
+
+    if (!validation.valid) {
+      res.status(403).json({ success: false, message: validation.error });
+      return;
+    }
+
+    const updated = await prisma.document.update({
+      where: { id },
+      data: { status: targetStatus },
+    });
+
+    await logActivityWithRequest(
+      req,
+      userId,
+      action, // ✅ sudah type-safe
+      {
+        title: document.title,
+        from: currentStatus,
+        to: targetStatus,
+        ...(reason && { reason }),
+      },
+      'DOCUMENT',
+      id
+    );
+
+    res.json({
+      success: true,
+      message: `Status berubah: ${currentStatus} → ${targetStatus}`,
+      data: updated,
+    });
+  } catch (error) {
+    console.error('Update status error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

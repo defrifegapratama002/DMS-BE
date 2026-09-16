@@ -11,6 +11,7 @@ import {
   restoreDocument,
   purgeDocument,
   emptyTrash,
+  updateDocumentStatus,
 } from '../controllers/documentController.js';
 import { DocumentMetaController } from '../controllers/metadataController.js';
 import { verifyToken } from '../middlewares/verifyToken.js';
@@ -58,6 +59,13 @@ router.patch(
   '/:id/meta',
   checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
   DocumentMetaController.updateMeta
+);
+
+// ✅ Status workflow (TAMBAHAN INI YANG KURANG)
+router.patch(
+  '/:id/status',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
+  updateDocumentStatus
 );
 
 router.post(
