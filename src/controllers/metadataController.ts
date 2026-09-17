@@ -235,6 +235,8 @@ export class DocumentTypeController {
   static async delete(req: AuthRequest, res: Response): Promise<void> {
     try {
       const id = req.params.id as string;
+      // Lepaskan dari dokumen dulu — relasinya RESTRICT, tanpa ini hapus gagal (500).
+      await prisma.document.updateMany({ where: { documentTypeId: id }, data: { documentTypeId: null } });
       await prisma.documentType.delete({ where: { id } });
 
       await logActivityWithRequest(
@@ -335,6 +337,8 @@ export class CorrespondentController {
   static async delete(req: AuthRequest, res: Response): Promise<void> {
     try {
       const id = req.params.id as string;
+      // Lepaskan dari dokumen dulu — relasinya RESTRICT, tanpa ini hapus gagal (500).
+      await prisma.document.updateMany({ where: { correspondentId: id }, data: { correspondentId: null } });
       await prisma.correspondent.delete({ where: { id } });
 
       await logActivityWithRequest(
