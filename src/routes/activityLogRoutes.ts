@@ -18,7 +18,7 @@ router.get(
 
 router.get(
   '/',
-  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN'),
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'AUDITOR'),
   ActivityLogController.getLogs
 );
 

@@ -45,19 +45,30 @@ export async function logActivity(data: ActivityLogData): Promise<void> {
         ? data.details
         : JSON.stringify(data.details);
 
-    await prisma.activityLog.create({
-      data: {
-        userId: data.userId,           // ✅ camelCase
-        action: data.action,
-        entityType: data.entityType || null,
-        entityId: data.entityId || null,
-        documentId: data.documentId || null,
-        details: detailsJson,
-        ipAddress: data.ipAddress,
-        userAgent: data.userAgent || null,
-        createdAt: data.timestamp || new Date(),
-      },
-    });
+    // Aksi pada dokumen otomatis terhubung ke dokumennya (dipakai tab "Riwayat").
+    const documentId =
+      data.documentId ||
+      (data.entityType === 'DOCUMENT' ? data.entityId : undefined) ||
+      null;
+
+    const base = {
+      userId: data.userId,           // ✅ camelCase
+      action: data.action,
+      entityType: data.entityType || null,
+      entityId: data.entityId || null,
+      details: detailsJson,
+      ipAddress: data.ipAddress,
+      userAgent: data.userAgent || null,
+      createdAt: data.timestamp || new Date(),
+    };
+
+    try {
+      await prisma.activityLog.create({ data: { ...base, documentId } });
+    } catch (error) {
+      // Dokumen sudah dihapus permanen → FK gagal; simpan log tanpa relasi.
+      if (!documentId) throw error;
+      await prisma.activityLog.create({ data: { ...base, documentId: null } });
+    }
   } catch (error) {
     logger.error(
       `Failed to log activity [${data.action}] for user ${data.userId}:`,

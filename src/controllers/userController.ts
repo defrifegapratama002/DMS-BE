@@ -31,6 +31,34 @@ const resetPasswordSchema = z.object({
 });
 
 export class UserController {
+  // ============ SEARCH (penerima share — semua role, field minimal) ============
+  static async searchUsers(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const q = String(req.query.q ?? '').trim();
+      const users = await prisma.user.findMany({
+        where: {
+          active: true,
+          id: { not: req.user!.id },
+          ...(q
+            ? {
+                OR: [
+                  { name: { contains: q, mode: 'insensitive' } },
+                  { email: { contains: q, mode: 'insensitive' } },
+                ],
+              }
+            : {}),
+        },
+        select: { id: true, name: true, email: true, role: true },
+        orderBy: { name: 'asc' },
+        take: 20,
+      });
+      res.json({ success: true, data: users });
+    } catch (error) {
+      console.error('Search users error:', error);
+      res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+  }
+
   // ============ LIST USERS ============
   static async getUsers(req: AuthRequest, res: Response): Promise<void> {
     try {
@@ -192,6 +220,7 @@ export class UserController {
           role: true,
           companyId: true,
           active: true,
+          lastLoginAt: true,
           createdAt: true,
         },
       });
@@ -272,6 +301,8 @@ export class UserController {
           name: true,
           role: true,
           active: true,
+          lastLoginAt: true,
+          createdAt: true,
           updatedAt: true,
         },
       });

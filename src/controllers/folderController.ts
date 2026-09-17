@@ -3,6 +3,11 @@ import { prisma } from '../config/prisma.js';
 import { z } from 'zod';
 import type { AuthRequest } from '../types/index.js';
 import { logActivityWithRequest } from '../utils/activityLogger.js';
+import { isAdmin, visibleFoldersWhere } from '../utils/access.js';
+
+/** Admin mengelola semua folder; selain itu hanya folder miliknya. */
+const manageableFolder = (id: string, user: { id: string; role: string }) =>
+  isAdmin(user.role) ? { id } : { id, ownerId: user.id };
 
 const createFolderSchema = z.object({
   name: z.string().min(1),
@@ -40,6 +45,26 @@ export const getFolderTree = async (req: AuthRequest, res: Response): Promise<vo
 };
 export const getFolderContents = getFolderTree;
 
+// GET /folders/all — daftar datar semua folder yang boleh dilihat user
+// (tree di atas hanya 3 tingkat; FE menyusun hierarki penuh dari parentFolderId).
+export const getAllFolders = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const folders = await prisma.folder.findMany({
+      where: visibleFoldersWhere(req.user!),
+      include: {
+        owner: { select: { id: true, name: true } },
+        _count: { select: { documents: { where: { deletedAt: null } }, subFolders: true } },
+      },
+      orderBy: { name: 'asc' },
+    });
+
+    res.json({ success: true, data: folders });
+  } catch (error) {
+    console.error('Get all folders error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
 // CREATE
 export const createFolder = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -48,7 +73,7 @@ export const createFolder = async (req: AuthRequest, res: Response): Promise<voi
 
     if (validated.parentFolderId) {
       const parent = await prisma.folder.findFirst({
-        where: { id: validated.parentFolderId, ownerId: userId },
+        where: manageableFolder(validated.parentFolderId, req.user!),
       });
       if (!parent) {
         res.status(404).json({ success: false, message: 'Parent folder not found' });
@@ -92,7 +117,7 @@ export const renameFolder = async (req: AuthRequest, res: Response): Promise<voi
     const userId = req.user!.id;
     const validated = updateFolderSchema.parse(req.body);
 
-    const folder = await prisma.folder.findFirst({ where: { id, ownerId: userId } });
+    const folder = await prisma.folder.findFirst({ where: manageableFolder(id, req.user!) });
     if (!folder) {
       res.status(404).json({ success: false, message: 'Folder not found' });
       return;
@@ -127,7 +152,7 @@ export const moveFolder = async (req: AuthRequest, res: Response): Promise<void>
     const userId = req.user!.id;
     const validated = moveFolderSchema.parse(req.body);
 
-    const folder = await prisma.folder.findFirst({ where: { id, ownerId: userId } });
+    const folder = await prisma.folder.findFirst({ where: manageableFolder(id, req.user!) });
     if (!folder) {
       res.status(404).json({ success: false, message: 'Folder not found' });
       return;
@@ -136,6 +161,23 @@ export const moveFolder = async (req: AuthRequest, res: Response): Promise<void>
     if (validated.parentFolderId === id) {
       res.status(400).json({ success: false, message: 'Cannot move folder to itself' });
       return;
+    }
+
+    // Cegah siklus: tujuan tidak boleh berada di bawah folder yang dipindah.
+    let cursor = validated.parentFolderId;
+    while (cursor) {
+      if (cursor === id) {
+        res.status(400).json({
+          success: false,
+          message: 'Tidak bisa memindahkan folder ke dalam sub-foldernya sendiri',
+        });
+        return;
+      }
+      const parent: { parentFolderId: string | null } | null = await prisma.folder.findUnique({
+        where: { id: cursor },
+        select: { parentFolderId: true },
+      });
+      cursor = parent?.parentFolderId ?? null;
     }
 
     const updated = await prisma.folder.update({
@@ -170,7 +212,7 @@ export const deleteFolder = async (req: AuthRequest, res: Response): Promise<voi
     const userId = req.user!.id;
 
     const folder = await prisma.folder.findFirst({
-      where: { id, ownerId: userId },
+      where: manageableFolder(id, req.user!),
       include: { subFolders: true, documents: true },
     });
 
@@ -179,10 +221,32 @@ export const deleteFolder = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
-    if (folder.documents.length > 0) {
+    // Sub-folder ikut terhapus (cascade), jadi dokumen di seluruh turunannya juga dicek.
+    const subtree = [id];
+    for (let i = 0; i < subtree.length; i++) {
+      const children = await prisma.folder.findMany({
+        where: { parentFolderId: subtree[i]! },
+        select: { id: true },
+      });
+      subtree.push(...children.map((c) => c.id));
+    }
+    const [activeDocs, trashedDocs] = await Promise.all([
+      prisma.document.count({ where: { folderId: { in: subtree }, deletedAt: null } }),
+      prisma.document.count({ where: { folderId: { in: subtree }, deletedAt: { not: null } } }),
+    ]);
+
+    if (activeDocs > 0) {
       res.status(400).json({
         success: false,
-        message: 'Cannot delete folder with documents',
+        message: 'Folder (atau sub-foldernya) masih berisi dokumen. Pindahkan atau hapus dokumennya dulu.',
+      });
+      return;
+    }
+
+    if (trashedDocs > 0) {
+      res.status(400).json({
+        success: false,
+        message: 'Folder masih punya dokumen di Sampah. Hapus permanen atau pulihkan dulu.',
       });
       return;
     }

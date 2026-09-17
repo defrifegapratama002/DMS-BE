@@ -31,11 +31,12 @@ export const verifyToken = async (
         name: true,
         role: true,
         companyId: true,
+        active: true,
       },
     });
 
-    if (!user) {
-      throw new AuthenticationError('User not found');
+    if (!user || !user.active) {
+      throw new AuthenticationError('User not found or inactive');
     }
 
     req.user = {

@@ -6,6 +6,7 @@ import { logActivityWithRequest } from '../utils/activityLogger.js';
 import { AppError } from '../utils/errorGuards.js';
 import type { AuthRequest } from '../types/index.js';
 import { z } from 'zod';
+import crypto from 'crypto';
 
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_SALT_ROUNDS || '10');
 
@@ -28,6 +29,11 @@ const refreshTokenSchema = z.object({
   refreshToken: z.string(),
 });
 
+// bcrypt bersalt → hash berbeda tiap kali, jadi tidak bisa dipakai untuk lookup.
+// Token JWT sudah ber-entropi tinggi, SHA-256 deterministik cukup & aman.
+const hashToken = (token: string): string =>
+  crypto.createHash('sha256').update(token).digest('hex');
+
 const generateAccessToken = (userId: string): string => {
   const secret = process.env.JWT_SECRET as string;
   const options: SignOptions = {
@@ -41,9 +47,14 @@ const generateRefreshToken = async (userId: string): Promise<string> => {
   const options: SignOptions = {
     expiresIn: (process.env.JWT_REFRESH_EXPIRES_IN || '7d') as any,
   };
-  const token = jwt.sign({ userId, type: 'refresh' }, secret, options);
+  // jti: dua token yang dibuat di detik yang sama tetap unik (tokenHash @unique)
+  const token = jwt.sign(
+    { userId, type: 'refresh', jti: crypto.randomUUID() },
+    secret,
+    options
+  );
 
-  const tokenHash = await bcrypt.hash(token, 10);
+  const tokenHash = hashToken(token);
 
   await prisma.refreshToken.create({
     data: {
@@ -146,6 +157,10 @@ export const login = async (req: Request, res: Response) => {
       throw new AppError('Invalid credentials', 401);
     }
 
+    if (!user.active) {
+      throw new AppError('Akun dinonaktifkan. Hubungi admin.', 403);
+    }
+
     const accessToken = generateAccessToken(user.id);
     const refreshToken = await generateRefreshToken(user.id);
 
@@ -208,7 +223,7 @@ export const refreshToken = async (req: Request, res: Response) => {
       process.env.JWT_REFRESH_SECRET as string
     ) as unknown as { userId: string };
 
-    const tokenHash = await bcrypt.hash(incomingToken, 10);
+    const tokenHash = hashToken(incomingToken);
     const storedToken = await prisma.refreshToken.findFirst({
       where: {
         userId: decoded.userId,
@@ -235,7 +250,7 @@ export const refreshToken = async (req: Request, res: Response) => {
 
     await prisma.refreshToken.update({
       where: { id: storedToken.id },
-      data: { replacedBy: newRefreshToken },
+      data: { replacedBy: hashToken(newRefreshToken) },
     });
 
     res.json({
@@ -279,7 +294,7 @@ export const logout = async (req: Request, res: Response) => {
     const { refreshToken: incomingToken } = req.body;
 
     if (incomingToken && userId) {
-      const tokenHash = await bcrypt.hash(incomingToken, 10);
+      const tokenHash = hashToken(incomingToken);
       await prisma.refreshToken.updateMany({
         where: { userId, tokenHash, revokedAt: null },
         data: { revokedAt: new Date() },

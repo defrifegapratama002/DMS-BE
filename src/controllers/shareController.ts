@@ -111,6 +111,8 @@ export const shareDocument = async (
     await logActivity({
       userId: req.user!.id,
       action: 'SHARE_DOCUMENT',
+      entityType: 'DOCUMENT',
+      entityId: documentId,
       details: `Membagikan dokumen "${document.title}" (ID: ${documentId}) ke user ${targetUser.email} dengan akses ${level}`,
       ipAddress: getClientIp(req),
     });
@@ -259,6 +261,8 @@ export const updateShareAccess = async (
     await logActivity({
       userId: req.user!.id,
       action: 'UPDATE_SHARE_ACCESS',
+      entityType: 'DOCUMENT',
+      entityId: share.documentId,
       details: `Mengubah level akses share (ID: ${shareId}) menjadi ${access_level}`,
       ipAddress: getClientIp(req),
     });
@@ -307,6 +311,8 @@ export const revokeShare = async (
     await logActivity({
       userId: req.user!.id,
       action: 'REVOKE_SHARE',
+      entityType: 'DOCUMENT',
+      entityId: share.documentId,
       details: `Mencabut akses share (ID: ${shareId}) untuk dokumen "${share.document.title}"`,
       ipAddress: getClientIp(req),
     });

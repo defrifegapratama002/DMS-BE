@@ -12,7 +12,13 @@ import {
   purgeDocument,
   emptyTrash,
   updateDocumentStatus,
+  moveDocument,
+  getDocumentFile,
+  getDocumentContent,
+  getDocumentHistory,
+  getSimilarDocuments,
 } from '../controllers/documentController.js';
+import { NoteController } from '../controllers/noteController.js';
 import { DocumentMetaController } from '../controllers/metadataController.js';
 import { verifyToken } from '../middlewares/verifyToken.js';
 import { checkRole } from '../middlewares/checkRole.js';
@@ -34,6 +40,13 @@ router.post(
   '/bulk-meta',
   checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
   DocumentMetaController.bulkUpdateMeta
+);
+
+// Catatan: hapus berdasarkan id catatan (statis, di atas /:id)
+router.delete(
+  '/notes/:noteId',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
+  NoteController.remove
 );
 
 // Documents CRUD
@@ -76,6 +89,27 @@ router.post(
 );
 
 router.get('/:id/versions', getDocumentVersions);
+
+// Berkas asli (pratinjau / unduh), isi terindeks, riwayat, dokumen mirip
+router.get('/:id/file', getDocumentFile);
+router.get('/:id/content', getDocumentContent);
+router.get('/:id/history', getDocumentHistory);
+router.get('/:id/similar', getSimilarDocuments);
+
+// Pindah folder
+router.patch(
+  '/:id/move',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
+  moveDocument
+);
+
+// Catatan dokumen
+router.get('/:id/notes', NoteController.list);
+router.post(
+  '/:id/notes',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN', 'EMPLOYEE'),
+  NoteController.create
+);
 
 router.post('/:id/restore', restoreDocument);
 

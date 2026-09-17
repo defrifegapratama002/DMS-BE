@@ -48,6 +48,7 @@ model User {
   logs          ActivityLog[]
   refreshTokens RefreshToken[]
   documentNotes DocumentNote[]
+  shareLinks    ShareLink[]
 
   @@map("users")
 }
@@ -104,6 +105,8 @@ model Document {
   documentDate    DateTime? @map("document_date")
   asn             String?   @unique
   customFields    Json?     @default("{}") @map("custom_fields")
+  // Batch 2: teks terindeks (txt/csv/md/json) untuk pencarian isi berkas
+  contentText     String?   @map("content_text")
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
@@ -117,6 +120,7 @@ model Document {
   documentTags   DocumentTag[]
   notes          DocumentNote[]
   activityLogs   ActivityLog[]
+  shareLinks     ShareLink[]
 
   @@index([folderId])
   @@index([uploadedBy])
@@ -133,6 +137,9 @@ model DocumentVersion {
   mimeType      String?  @map("mime_type")
   uploadedBy    String   @map("uploaded_by")
   changelog     String?
+  // Batch 2: SHA-256 berkas (deteksi duplikat) + nama berkas asli
+  checksum      String?
+  originalName  String?  @map("original_name")
   createdAt     DateTime @default(now()) @map("created_at")
 
   document       Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
@@ -141,6 +148,7 @@ model DocumentVersion {
   @@unique([documentId, versionNumber])
   @@index([documentId])
   @@index([uploadedBy])
+  @@index([checksum])
   @@map("document_versions")
 }
 
@@ -228,6 +236,60 @@ model DocumentNote {
   @@index([documentId])
   @@index([userId])
   @@map("document_notes")
+}
+
+// ============ BATCH 2: SHARE LINK, CUSTOM FIELD, OTOMATISASI ============
+model ShareLink {
+  id          String      @id @default(uuid())
+  documentId  String      @map("document_id")
+  token       String      @unique
+  // Hanya VIEWER / DOWNLOADER yang dipakai untuk tautan publik
+  access      AccessLevel @default(VIEWER)
+  expiresAt   DateTime?   @map("expires_at")
+  createdBy   String      @map("created_by")
+  accessCount Int         @default(0) @map("access_count")
+  createdAt   DateTime    @default(now()) @map("created_at")
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  creator  User     @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@map("share_links")
+}
+
+model CustomField {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  // text | number | date | boolean | select | money | url
+  type      String
+  options   String[] @default([])
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("custom_fields")
+}
+
+model WorkflowRule {
+  id                    String          @id @default(uuid())
+  name                  String
+  enabled               Boolean         @default(true)
+  sortOrder             Int             @default(0) @map("sort_order")
+  // upload | status_change
+  trigger               String
+  triggerStatus         DocumentStatus? @map("trigger_status")
+  matchFolderId         String?         @map("match_folder_id")
+  matchExtensions       String[]        @default([]) @map("match_extensions")
+  matchTitleContains    String          @default("") @map("match_title_contains")
+  assignTagIds          String[]        @default([]) @map("assign_tag_ids")
+  assignTypeId          String?         @map("assign_type_id")
+  assignCorrespondentId String?         @map("assign_correspondent_id")
+  assignStatus          DocumentStatus? @map("assign_status")
+  runCount              Int             @default(0) @map("run_count")
+  lastRunAt             DateTime?       @map("last_run_at")
+  createdAt             DateTime        @default(now()) @map("created_at")
+  updatedAt             DateTime        @updatedAt @map("updated_at")
+
+  @@map("workflow_rules")
 }
 
 // ============ ACTIVITY & AUTH ============

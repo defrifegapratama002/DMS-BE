@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type { AuthRequest } from '../types/index.js';
 import { logActivityWithRequest } from '../utils/activityLogger.js';
 import { AppError } from '../utils/errorGuards.js';
+import { canEditDocument } from '../utils/access.js';
 
 // ============ Validation Schemas ============
 const tagSchema = z.object({
@@ -27,9 +28,23 @@ const updateMetaSchema = z.object({
   tagIds: z.array(z.string().uuid()).optional(),
   documentTypeId: z.string().uuid().nullable().optional(),
   correspondentId: z.string().uuid().nullable().optional(),
-  documentDate: z.string().datetime().nullable().optional(),
-  asn: z.string().nullable().optional(),
+  // Terima 'YYYY-MM-DD' (input tanggal) maupun ISO datetime
+  documentDate: z
+    .string()
+    .refine((v) => !Number.isNaN(Date.parse(v)), 'Tanggal tidak valid')
+    .nullable()
+    .optional(),
+  // FE mengirim angka, kolomnya string unik
+  asn: z
+    .union([z.string(), z.number()])
+    .transform((v) => String(v).trim() || null)
+    .nullable()
+    .optional(),
   description: z.string().nullable().optional(),
+  // Nilai bidang khusus per id CustomField
+  customFields: z
+    .record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]))
+    .optional(),
 });
 
 // =============================================
@@ -352,7 +367,10 @@ export class DocumentMetaController {
       // Cek akses
       const document = await prisma.document.findUnique({
         where: { id },
-        include: { shares: { where: { userId, accessLevel: 'EDITOR' } } },
+        include: {
+          folder: { select: { ownerId: true } },
+          shares: { select: { userId: true, accessLevel: true } },
+        },
       });
 
       if (!document) {
@@ -365,8 +383,7 @@ export class DocumentMetaController {
         return;
       }
 
-      const hasEdit = document.uploadedBy === userId || document.shares.length > 0;
-      if (!hasEdit) {
+      if (!canEditDocument(document, req.user!)) {
         res.status(403).json({ success: false, message: 'Access denied' });
         return;
       }
@@ -387,7 +404,23 @@ export class DocumentMetaController {
         updateData.documentDate = validated.documentDate ? new Date(validated.documentDate) : null;
       }
       if (validated.asn !== undefined) {
+        if (validated.asn) {
+          const clash = await prisma.document.findFirst({
+            where: { asn: validated.asn, id: { not: id } },
+            select: { title: true },
+          });
+          if (clash) {
+            res.status(409).json({
+              success: false,
+              message: `Nomor arsip (ASN) ${validated.asn} sudah dipakai dokumen "${clash.title}".`,
+            });
+            return;
+          }
+        }
         updateData.asn = validated.asn;
+      }
+      if (validated.customFields !== undefined) {
+        updateData.customFields = validated.customFields;
       }
 
       // Handle tags (delete + recreate)
@@ -410,7 +443,9 @@ export class DocumentMetaController {
       const updated = await prisma.document.update({
         where: { id },
         data: updateData,
+        omit: { contentText: true },
         include: {
+          folder: { select: { id: true, name: true, ownerId: true } },
           documentType: true,
           correspondent: true,
           documentTags: { include: { tag: true } },
@@ -460,8 +495,14 @@ export class DocumentMetaController {
     const results: string[] = [];
 
     for (const docId of ids) {
-      const doc = await prisma.document.findUnique({ where: { id: docId } });
-      if (!doc || doc.deletedAt || doc.uploadedBy !== userId) continue;
+      const doc = await prisma.document.findUnique({
+        where: { id: docId },
+        include: {
+          folder: { select: { ownerId: true } },
+          shares: { select: { userId: true, accessLevel: true } },
+        },
+      });
+      if (!doc || doc.deletedAt || !canEditDocument(doc, req.user!)) continue;
 
       const updateData: any = {};
       if (documentTypeId !== undefined) updateData.documentTypeId = documentTypeId;

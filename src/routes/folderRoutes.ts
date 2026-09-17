@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import {
   getFolderTree,
+  getAllFolders,
   createFolder,
   renameFolder,
   moveFolder,
@@ -14,6 +15,7 @@ const router = Router();
 router.use(verifyToken);
 
 router.get('/', getFolderTree);
+router.get('/all', getAllFolders);
 
 router.post(
   '/',

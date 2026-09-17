@@ -1,4 +1,5 @@
 import type { Response } from 'express';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma.js';
 import { z } from 'zod';
 import fs from 'fs';
@@ -10,12 +11,25 @@ import {
   getActionForTransition,
   type DocumentStatus,
 } from '../lib/workflow.js';
+import { runAutomation } from '../lib/automation.js';
+import {
+  canDownloadDocument,
+  canEditDocument,
+  canReadDocument,
+  isAdmin,
+  isDocumentOwner,
+  shareLevelFor,
+  visibleDocumentsWhere,
+} from '../utils/access.js';
+import { extractText, mimeForExtension, sha256File } from '../utils/fileInfo.js';
 
 // ============ Validation ============
 const createDocumentSchema = z.object({
   title: z.string().min(1),
   description: z.string().optional(),
   folderId: z.string().uuid(),
+  // multipart → string; "true" = pengguna sudah mengonfirmasi unggah berkas identik
+  allowDuplicate: z.string().optional(),
 });
 
 const updateDocumentSchema = z.object({
@@ -24,38 +38,68 @@ const updateDocumentSchema = z.object({
   // ✅ `status` dihapus — ubah status HARUS lewat PATCH /:id/status
 });
 
+const moveDocumentSchema = z.object({
+  folderId: z.string().uuid(),
+});
+
+/** Relasi yang dibutuhkan daftar & kartu dokumen di FE. */
+const LIST_INCLUDE = {
+  folder: { select: { id: true, name: true, ownerId: true } },
+  documentTags: { include: { tag: true } },
+  documentType: true,
+  correspondent: true,
+} satisfies Prisma.DocumentInclude;
+
+/** Relasi minimum untuk cek akses. */
+const ACCESS_INCLUDE = {
+  folder: { select: { id: true, name: true, ownerId: true } },
+  shares: { select: { userId: true, accessLevel: true } },
+} satisfies Prisma.DocumentInclude;
+
+function removeFile(filePath?: string | null): void {
+  if (!filePath) return;
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch (e) {
+    console.error('Failed to delete file:', filePath, e);
+  }
+}
+
 // ============ GET ALL (exclude trash) ============
 export const getDocuments = async (
   req: AuthRequest,
   res: Response
 ): Promise<void> => {
   try {
-    const userId = req.user!.id;
+    const user = req.user!;
     const { folderId, search, status, page = 1, limit = 10 } = req.query;
 
-    const where: any = {
-      deletedAt: null,
-    };
+    const where: Prisma.DocumentWhereInput = { AND: [visibleDocumentsWhere(user)] };
+    const and = where.AND as Prisma.DocumentWhereInput[];
 
-    if (folderId) where.folderId = folderId as string;
-    if (status) where.status = status as string;
+    if (folderId) and.push({ folderId: folderId as string });
+    if (status) and.push({ status: status as DocumentStatus });
 
     if (search) {
-      where.OR = [
-        { title: { contains: search as string, mode: 'insensitive' } },
-        { description: { contains: search as string, mode: 'insensitive' } },
-      ];
+      and.push({
+        OR: [
+          { title: { contains: search as string, mode: 'insensitive' } },
+          { description: { contains: search as string, mode: 'insensitive' } },
+        ],
+      });
     }
 
-    const pageNum = Number(page);
-    const limitNum = Number(limit);
+    const pageNum = Math.max(1, Number(page) || 1);
+    const limitNum = Math.min(1000, Math.max(1, Number(limit) || 10));
     const skip = (pageNum - 1) * limitNum;
 
     const [documents, total] = await Promise.all([
       prisma.document.findMany({
         where,
+        // contentText bisa besar — jangan ikut di daftar
+        omit: { contentText: true },
         include: {
-          folder: { select: { id: true, name: true } },
+          ...LIST_INCLUDE,
           versions: {
             orderBy: { versionNumber: 'desc' },
             take: 1,
@@ -67,7 +111,7 @@ export const getDocuments = async (
             },
           },
           shares: {
-            where: { userId },
+            where: { userId: user.id },
             select: { accessLevel: true, userId: true },
           },
         },
@@ -79,11 +123,11 @@ export const getDocuments = async (
     ]);
 
     const documentsWithAccess = documents.map((doc) => {
-      const userShare = doc.shares.find((s) => s.userId === userId);
+      const userShare = doc.shares.find((s) => s.userId === user.id);
       return {
         ...doc,
         accessLevel: userShare?.accessLevel || null,
-        isOwner: doc.uploadedBy === userId,
+        isOwner: doc.uploadedBy === user.id,
       };
     });
 
@@ -110,50 +154,86 @@ export const uploadDocument = async (
   req: AuthRequest,
   res: Response
 ): Promise<void> => {
+  const file = (req as any).file as Express.Multer.File | undefined;
   try {
-    const userId = req.user!.id;
+    const user = req.user!;
+    const userId = user.id;
     const validated = createDocumentSchema.parse(req.body);
-    const file = (req as any).file as Express.Multer.File | undefined;
 
     if (!file) {
       res.status(400).json({ success: false, message: 'File is required' });
       return;
     }
 
+    // Admin boleh mengunggah ke folder mana pun; selain itu hanya ke folder miliknya.
     const folder = await prisma.folder.findFirst({
-      where: { id: validated.folderId, ownerId: userId },
+      where: isAdmin(user.role)
+        ? { id: validated.folderId }
+        : { id: validated.folderId, ownerId: userId },
     });
 
     if (!folder) {
-      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      removeFile(file.path);
       res
         .status(404)
         .json({ success: false, message: 'Folder not found or not owned' });
       return;
     }
 
-    const document = await prisma.document.create({
+    // Deteksi duplikat: berkas identik (SHA-256) yang masih aktif.
+    const checksum = await sha256File(file.path);
+    if (validated.allowDuplicate !== 'true') {
+      const twin = await prisma.documentVersion.findFirst({
+        where: { checksum, document: { deletedAt: null } },
+        include: {
+          document: {
+            select: { id: true, title: true, folder: { select: { name: true } } },
+          },
+        },
+      });
+      if (twin) {
+        removeFile(file.path);
+        res.status(409).json({
+          success: false,
+          code: 'DUPLICATE_DOCUMENT',
+          message: `Berkas identik sudah ada: "${twin.document.title}" di folder ${twin.document.folder.name}.`,
+          data: {
+            existing: {
+              id: twin.document.id,
+              title: twin.document.title,
+              folderName: twin.document.folder.name,
+            },
+          },
+        });
+        return;
+      }
+    }
+
+    const extension = path.extname(file.originalname).slice(1).toLowerCase();
+
+    const created = await prisma.document.create({
       data: {
         title: validated.title,
-        extension: path.extname(file.originalname).slice(1),
+        extension,
         sizeBytes: BigInt(file.size),
         folderId: validated.folderId,
         description: validated.description || '',
         uploadedBy: userId,
         currentVersion: 1,
         status: 'DRAFT',
+        contentText: extractText(file.path, extension),
         versions: {
           create: {
             versionNumber: 1,
             s3FileKey: file.path,
+            fileSize: BigInt(file.size),
+            mimeType: file.mimetype,
+            checksum,
+            originalName: file.originalname,
             uploadedBy: userId,
             changelog: 'Initial upload',
           },
         },
-      },
-      include: {
-        folder: { select: { id: true, name: true } },
-        versions: { orderBy: { versionNumber: 'desc' }, take: 1 },
       },
     });
 
@@ -162,21 +242,33 @@ export const uploadDocument = async (
       userId,
       'CREATE_DOCUMENT',
       {
-        title: document.title,
+        title: created.title,
         fileName: file.originalname,
         fileSize: file.size,
         version: 1,
       },
       'DOCUMENT',
-      document.id
+      created.id
     );
+
+    const appliedRules = await runAutomation(req, userId, 'upload', created);
+
+    const document = await prisma.document.findUnique({
+      where: { id: created.id },
+      omit: { contentText: true },
+      include: {
+        ...LIST_INCLUDE,
+        versions: { orderBy: { versionNumber: 'desc' }, take: 1 },
+      },
+    });
 
     res.status(201).json({
       success: true,
       message: 'Document uploaded successfully',
-      data: document,
+      data: { ...document, appliedRules },
     });
   } catch (error) {
+    removeFile(file?.path);
     if (error instanceof z.ZodError) {
       res
         .status(400)
@@ -195,16 +287,20 @@ export const getDocumentDetail = async (
 ): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const userId = req.user!.id;
+    const user = req.user!;
+    const userId = user.id;
 
     const document = await prisma.document.findUnique({
       where: { id },
+      omit: { contentText: true },
       include: {
         folder: true,
-        uploadedByUser: { select: { id: true, name: true, email: true } },
+        uploadedByUser: { select: { id: true, name: true, email: true, role: true } },
         versions: { orderBy: { versionNumber: 'desc' } },
         shares: {
-          include: { user: { select: { id: true, name: true, email: true } } },
+          include: {
+            user: { select: { id: true, name: true, email: true, role: true } },
+          },
         },
         documentType: true,
         correspondent: true,
@@ -225,13 +321,7 @@ export const getDocumentDetail = async (
       return;
     }
 
-    const userShare = document.shares.find((s) => s.userId === userId);
-    const hasAccess =
-      document.uploadedBy === userId ||
-      userShare ||
-      document.status === 'APPROVED';
-
-    if (!hasAccess) {
+    if (!canReadDocument(document, user)) {
       res.status(403).json({ success: false, message: 'Access denied' });
       return;
     }
@@ -250,8 +340,10 @@ export const getDocumentDetail = async (
       data: {
         ...document,
         userAccess: {
-          isOwner: document.uploadedBy === userId,
-          accessLevel: userShare?.accessLevel || null,
+          isOwner: isDocumentOwner(document, userId),
+          accessLevel: shareLevelFor(document, userId),
+          canEdit: canEditDocument(document, user),
+          canDownload: canDownloadDocument(document, user),
         },
       },
     });
@@ -268,10 +360,13 @@ export const updateDocument = async (
 ): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const userId = req.user!.id;
+    const user = req.user!;
     const validated = updateDocumentSchema.parse(req.body);
 
-    const existing = await prisma.document.findUnique({ where: { id } });
+    const existing = await prisma.document.findUnique({
+      where: { id },
+      include: ACCESS_INCLUDE,
+    });
     if (!existing) {
       res.status(404).json({ success: false, message: 'Document not found' });
       return;
@@ -285,11 +380,7 @@ export const updateDocument = async (
       return;
     }
 
-    const userShare = await prisma.documentShare.findFirst({
-      where: { documentId: id, userId, accessLevel: 'EDITOR' },
-    });
-
-    if (existing.uploadedBy !== userId && !userShare) {
+    if (!canEditDocument(existing, user)) {
       res.status(403).json({ success: false, message: 'Access denied' });
       return;
     }
@@ -297,11 +388,13 @@ export const updateDocument = async (
     const updated = await prisma.document.update({
       where: { id },
       data: validated,
+      omit: { contentText: true },
+      include: LIST_INCLUDE,
     });
 
     await logActivityWithRequest(
       req,
-      userId,
+      user.id,
       'RENAME_DOCUMENT',
       { title: updated.title, changes: validated },
       'DOCUMENT',
@@ -326,16 +419,78 @@ export const updateDocument = async (
 };
 export const renameDocument = updateDocument;
 
-// ============ UPLOAD NEW VERSION ============
-export const uploadNewVersion = async (
+// ============ MOVE ============
+export const moveDocument = async (
   req: AuthRequest,
   res: Response
 ): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const userId = req.user!.id;
+    const user = req.user!;
+    const { folderId } = moveDocumentSchema.parse(req.body);
+
+    const existing = await prisma.document.findUnique({
+      where: { id },
+      include: ACCESS_INCLUDE,
+    });
+    if (!existing || existing.deletedAt) {
+      res.status(404).json({ success: false, message: 'Document not found' });
+      return;
+    }
+
+    if (!canEditDocument(existing, user)) {
+      res.status(403).json({ success: false, message: 'Access denied' });
+      return;
+    }
+
+    const target = await prisma.folder.findFirst({
+      where: isAdmin(user.role) ? { id: folderId } : { id: folderId, ownerId: user.id },
+    });
+    if (!target) {
+      res.status(404).json({ success: false, message: 'Target folder not found' });
+      return;
+    }
+
+    const updated = await prisma.document.update({
+      where: { id },
+      data: { folderId },
+      omit: { contentText: true },
+      include: LIST_INCLUDE,
+    });
+
+    await logActivityWithRequest(
+      req,
+      user.id,
+      'MOVE_DOCUMENT',
+      { title: existing.title, from: existing.folder.name, to: target.name },
+      'DOCUMENT',
+      id
+    );
+
+    res.json({ success: true, message: 'Document moved', data: updated });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res
+        .status(400)
+        .json({ success: false, message: 'Validation error', errors: error.issues });
+      return;
+    }
+    console.error('Move document error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// ============ UPLOAD NEW VERSION ============
+export const uploadNewVersion = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  const file = (req as any).file as Express.Multer.File | undefined;
+  try {
+    const id = req.params.id as string;
+    const user = req.user!;
+    const userId = user.id;
     const { changelog } = req.body;
-    const file = (req as any).file as Express.Multer.File | undefined;
 
     if (!file) {
       res.status(400).json({ success: false, message: 'File is required' });
@@ -344,17 +499,17 @@ export const uploadNewVersion = async (
 
     const document = await prisma.document.findUnique({
       where: { id },
-      include: { shares: { where: { userId, accessLevel: 'EDITOR' } } },
+      include: ACCESS_INCLUDE,
     });
 
     if (!document) {
-      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      removeFile(file.path);
       res.status(404).json({ success: false, message: 'Document not found' });
       return;
     }
 
     if (document.deletedAt) {
-      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      removeFile(file.path);
       res.status(400).json({
         success: false,
         message: 'Cannot upload version to a document in trash',
@@ -362,10 +517,8 @@ export const uploadNewVersion = async (
       return;
     }
 
-    const hasEditAccess =
-      document.uploadedBy === userId || document.shares.length > 0;
-    if (!hasEditAccess) {
-      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+    if (!canEditDocument(document, user)) {
+      removeFile(file.path);
       res.status(403).json({
         success: false,
         message: 'Access denied. EDITOR access required.',
@@ -374,21 +527,35 @@ export const uploadNewVersion = async (
     }
 
     const newVersion = document.currentVersion + 1;
+    const extension =
+      path.extname(file.originalname).slice(1).toLowerCase() || document.extension;
+    const checksum = await sha256File(file.path);
 
     const updatedDocument = await prisma.document.update({
       where: { id },
       data: {
         currentVersion: newVersion,
+        extension,
+        sizeBytes: BigInt(file.size),
+        contentText: extractText(file.path, extension),
         versions: {
           create: {
             versionNumber: newVersion,
             s3FileKey: file.path,
+            fileSize: BigInt(file.size),
+            mimeType: file.mimetype,
+            checksum,
+            originalName: file.originalname,
             uploadedBy: userId,
             changelog: changelog || 'New version uploaded',
           },
         },
       },
-      include: { versions: { orderBy: { versionNumber: 'desc' }, take: 1 } },
+      omit: { contentText: true },
+      include: {
+        ...LIST_INCLUDE,
+        versions: { orderBy: { versionNumber: 'desc' }, take: 1 },
+      },
     });
 
     await logActivityWithRequest(
@@ -412,6 +579,7 @@ export const uploadNewVersion = async (
       data: updatedDocument,
     });
   } catch (error) {
+    removeFile(file?.path);
     console.error('Upload version error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
@@ -424,27 +592,14 @@ export const getDocumentVersions = async (
 ): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const userId = req.user!.id;
+    const user = req.user!;
 
     const document = await prisma.document.findFirst({
-      where: {
-        id,
-        deletedAt: null,
-        OR: [
-          { uploadedBy: userId },
-          {
-            shares: {
-              some: {
-                userId,
-                accessLevel: { in: ['VIEWER', 'DOWNLOADER', 'EDITOR'] },
-              },
-            },
-          },
-        ],
-      },
+      where: { id, deletedAt: null },
+      include: ACCESS_INCLUDE,
     });
 
-    if (!document) {
+    if (!document || !canReadDocument(document, user)) {
       res
         .status(404)
         .json({ success: false, message: 'Not found or access denied' });
@@ -464,6 +619,193 @@ export const getDocumentVersions = async (
 };
 export const getVersionHistory = getDocumentVersions;
 
+// ============ FILE (pratinjau / unduh) ============
+// GET /:id/file?version=2&download=1
+export const getDocumentFile = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const user = req.user!;
+    const isDownload = req.query.download === '1' || req.query.download === 'true';
+
+    const document = await prisma.document.findFirst({
+      where: { id, deletedAt: null },
+      include: ACCESS_INCLUDE,
+    });
+
+    if (!document || !canReadDocument(document, user)) {
+      res.status(404).json({ success: false, message: 'Not found or access denied' });
+      return;
+    }
+
+    if (isDownload && !canDownloadDocument(document, user)) {
+      res.status(403).json({
+        success: false,
+        message: 'Akses Anda hanya untuk melihat, tidak untuk mengunduh.',
+      });
+      return;
+    }
+
+    const versionNumber = req.query.version
+      ? Number(req.query.version)
+      : document.currentVersion;
+    const version = await prisma.documentVersion.findUnique({
+      where: { documentId_versionNumber: { documentId: id, versionNumber } },
+    });
+
+    if (!version) {
+      res.status(404).json({ success: false, message: 'Version not found' });
+      return;
+    }
+
+    const absolute = path.resolve(version.s3FileKey);
+    if (!fs.existsSync(absolute)) {
+      res.status(404).json({ success: false, message: 'File tidak ditemukan di storage' });
+      return;
+    }
+
+    if (isDownload) {
+      await logActivityWithRequest(
+        req,
+        user.id,
+        'DOWNLOAD_DOCUMENT',
+        { title: document.title, version: versionNumber },
+        'DOCUMENT',
+        id
+      );
+    }
+
+    const ext = path.extname(version.s3FileKey).slice(1) || document.extension;
+    const suffix = versionNumber === document.currentVersion ? '' : ` (v${versionNumber})`;
+    const filename = `${document.title}${suffix}.${ext}`;
+
+    res.setHeader('Content-Type', mimeForExtension(ext));
+    res.setHeader(
+      'Content-Disposition',
+      `${isDownload ? 'attachment' : 'inline'}; filename*=UTF-8''${encodeURIComponent(filename)}`
+    );
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    fs.createReadStream(absolute).pipe(res);
+  } catch (error) {
+    console.error('Get document file error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// ============ KONTEN TERINDEKS ============
+export const getDocumentContent = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const document = await prisma.document.findFirst({
+      where: { id, deletedAt: null },
+      include: ACCESS_INCLUDE,
+    });
+
+    if (!document || !canReadDocument(document, req.user!)) {
+      res.status(404).json({ success: false, message: 'Not found or access denied' });
+      return;
+    }
+
+    res.json({ success: true, data: { content: document.contentText ?? null } });
+  } catch (error) {
+    console.error('Get document content error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// ============ RIWAYAT AKTIVITAS SATU DOKUMEN ============
+export const getDocumentHistory = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const document = await prisma.document.findFirst({
+      where: { id, deletedAt: null },
+      include: ACCESS_INCLUDE,
+    });
+
+    if (!document || !canReadDocument(document, req.user!)) {
+      res.status(404).json({ success: false, message: 'Not found or access denied' });
+      return;
+    }
+
+    const logs = await prisma.activityLog.findMany({
+      where: {
+        documentId: id,
+        // "dilihat" terlalu bising untuk riwayat
+        action: { not: 'VIEW_DOCUMENT' },
+      },
+      include: { user: { select: { id: true, name: true, email: true, role: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+
+    res.json({ success: true, data: logs });
+  } catch (error) {
+    console.error('Get document history error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// ============ DOKUMEN MIRIP ============
+// Skor: tag sama (+2/tag), tipe sama (+2), pihak sama (+2), folder sama (+1).
+export const getSimilarDocuments = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const user = req.user!;
+
+    const source = await prisma.document.findFirst({
+      where: { id, deletedAt: null },
+      include: { ...ACCESS_INCLUDE, documentTags: true },
+    });
+    if (!source || !canReadDocument(source, user)) {
+      res.status(404).json({ success: false, message: 'Not found or access denied' });
+      return;
+    }
+
+    const tagIds = source.documentTags.map((t) => t.tagId);
+    const or: Prisma.DocumentWhereInput[] = [{ folderId: source.folderId }];
+    if (tagIds.length > 0) or.push({ documentTags: { some: { tagId: { in: tagIds } } } });
+    if (source.documentTypeId) or.push({ documentTypeId: source.documentTypeId });
+    if (source.correspondentId) or.push({ correspondentId: source.correspondentId });
+
+    const candidates = await prisma.document.findMany({
+      where: { AND: [visibleDocumentsWhere(user), { id: { not: id } }, { OR: or }] },
+      omit: { contentText: true },
+      include: LIST_INCLUDE,
+      take: 200,
+    });
+
+    const scored = candidates
+      .map((d) => {
+        const sharedTags = d.documentTags.filter((t) => tagIds.includes(t.tagId)).length;
+        const score =
+          sharedTags * 2 +
+          (source.documentTypeId && d.documentTypeId === source.documentTypeId ? 2 : 0) +
+          (source.correspondentId && d.correspondentId === source.correspondentId ? 2 : 0) +
+          (d.folderId === source.folderId ? 1 : 0);
+        return { ...d, score };
+      })
+      .filter((d) => d.score >= 2)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+
+    res.json({ success: true, data: scored });
+  } catch (error) {
+    console.error('Get similar documents error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
 // ============ DELETE (soft delete → trash) ============
 export const deleteDocument = async (
   req: AuthRequest,
@@ -471,9 +813,12 @@ export const deleteDocument = async (
 ): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const userId = req.user!.id;
+    const user = req.user!;
 
-    const document = await prisma.document.findUnique({ where: { id } });
+    const document = await prisma.document.findUnique({
+      where: { id },
+      include: ACCESS_INCLUDE,
+    });
     if (!document) {
       res.status(404).json({ success: false, message: 'Document not found' });
       return;
@@ -486,6 +831,11 @@ export const deleteDocument = async (
       return;
     }
 
+    if (!isAdmin(user.role) && !isDocumentOwner(document, user.id)) {
+      res.status(403).json({ success: false, message: 'Access denied' });
+      return;
+    }
+
     await prisma.document.update({
       where: { id },
       data: { deletedAt: new Date() },
@@ -493,7 +843,7 @@ export const deleteDocument = async (
 
     await logActivityWithRequest(
       req,
-      userId,
+      user.id,
       'DELETE_DOCUMENT',
       { title: document.title, mode: 'soft-delete' },
       'DOCUMENT',
@@ -507,19 +857,24 @@ export const deleteDocument = async (
   }
 };
 
+/** Sampah: admin melihat semuanya; selain itu hanya miliknya. */
+function trashWhere(user: { id: string; role: string }): Prisma.DocumentWhereInput {
+  if (isAdmin(user.role)) return { deletedAt: { not: null } };
+  return {
+    deletedAt: { not: null },
+    OR: [{ uploadedBy: user.id }, { folder: { ownerId: user.id } }],
+  };
+}
+
 // ============ GET TRASH ============
 export const getTrash = async (
   req: AuthRequest,
   res: Response
 ): Promise<void> => {
   try {
-    const userId = req.user!.id;
-
     const documents = await prisma.document.findMany({
-      where: {
-        deletedAt: { not: null },
-        OR: [{ uploadedBy: userId }, { folder: { ownerId: userId } }],
-      },
+      where: trashWhere(req.user!),
+      omit: { contentText: true },
       include: {
         folder: { select: { id: true, name: true } },
       },
@@ -540,9 +895,12 @@ export const restoreDocument = async (
 ): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const userId = req.user!.id;
+    const user = req.user!;
 
-    const document = await prisma.document.findUnique({ where: { id } });
+    const document = await prisma.document.findUnique({
+      where: { id },
+      include: ACCESS_INCLUDE,
+    });
     if (!document) {
       res.status(404).json({ success: false, message: 'Document not found' });
       return;
@@ -555,21 +913,32 @@ export const restoreDocument = async (
       return;
     }
 
-    await prisma.document.update({
+    if (!isAdmin(user.role) && !isDocumentOwner(document, user.id)) {
+      res.status(403).json({ success: false, message: 'Access denied' });
+      return;
+    }
+
+    const restored = await prisma.document.update({
       where: { id },
       data: { deletedAt: null },
+      omit: { contentText: true },
+      include: LIST_INCLUDE,
     });
 
     await logActivityWithRequest(
       req,
-      userId,
+      user.id,
       'RESTORE_DOCUMENT',
       { title: document.title },
       'DOCUMENT',
       id
     );
 
-    res.json({ success: true, message: 'Document restored successfully' });
+    res.json({
+      success: true,
+      message: 'Document restored successfully',
+      data: restored,
+    });
   } catch (error) {
     console.error('Restore document error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
@@ -603,15 +972,7 @@ export const purgeDocument = async (
       return;
     }
 
-    for (const v of document.versions) {
-      if (v.s3FileKey && fs.existsSync(v.s3FileKey)) {
-        try {
-          fs.unlinkSync(v.s3FileKey);
-        } catch (e) {
-          console.error('Failed to delete file:', v.s3FileKey, e);
-        }
-      }
-    }
+    for (const v of document.versions) removeFile(v.s3FileKey);
 
     await prisma.document.delete({ where: { id } });
 
@@ -640,23 +1001,12 @@ export const emptyTrash = async (
     const userId = req.user!.id;
 
     const documents = await prisma.document.findMany({
-      where: {
-        deletedAt: { not: null },
-        OR: [{ uploadedBy: userId }, { folder: { ownerId: userId } }],
-      },
+      where: trashWhere(req.user!),
       include: { versions: true },
     });
 
     for (const doc of documents) {
-      for (const v of doc.versions) {
-        if (v.s3FileKey && fs.existsSync(v.s3FileKey)) {
-          try {
-            fs.unlinkSync(v.s3FileKey);
-          } catch (e) {
-            console.error('Failed to delete file:', v.s3FileKey, e);
-          }
-        }
-      }
+      for (const v of doc.versions) removeFile(v.s3FileKey);
     }
 
     await prisma.document.deleteMany({
@@ -716,11 +1066,11 @@ export const updateDocumentStatus = async (
     const targetStatus = newStatus as DocumentStatus;
 
     const action = getActionForTransition(currentStatus, targetStatus, {
-    userId,
-    userRole,
-    documentOwnerId: document.uploadedBy,
-    hasReason: !!(reason && reason.trim()),
-  });
+      userId,
+      userRole,
+      documentOwnerId: document.uploadedBy,
+      hasReason: !!(reason && reason.trim()),
+    });
     if (!action) {
       res.status(400).json({
         success: false,
@@ -743,7 +1093,7 @@ export const updateDocumentStatus = async (
       return;
     }
 
-    const updated = await prisma.document.update({
+    await prisma.document.update({
       where: { id },
       data: { status: targetStatus },
     });
@@ -762,10 +1112,31 @@ export const updateDocumentStatus = async (
       id
     );
 
+    // Alasan penolakan ikut jadi catatan dokumen agar terlihat di tab Catatan.
+    if (reason && String(reason).trim()) {
+      await prisma.documentNote.create({
+        data: {
+          documentId: id,
+          userId,
+          body: `[${action === 'REJECT' ? 'Ditolak' : 'Status'}] ${String(reason).trim()}`,
+        },
+      });
+    }
+
+    const appliedRules = await runAutomation(req, userId, 'status_change', document, {
+      newStatus: targetStatus,
+    });
+
+    const updated = await prisma.document.findUnique({
+      where: { id },
+      omit: { contentText: true },
+      include: LIST_INCLUDE,
+    });
+
     res.json({
       success: true,
       message: `Status berubah: ${currentStatus} → ${targetStatus}`,
-      data: updated,
+      data: { ...updated, appliedRules },
     });
   } catch (error) {
     console.error('Update status error:', error);

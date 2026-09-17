@@ -4,6 +4,7 @@ import {
   DocumentTypeController,
   CorrespondentController,
 } from '../controllers/metadataController.js';
+import { CustomFieldController } from '../controllers/customFieldController.js';
 import { verifyToken } from '../middlewares/verifyToken.js';
 import { checkRole } from '../middlewares/checkRole.js';
 
@@ -62,6 +63,24 @@ router.delete(
   '/correspondents/:id',
   checkRole('SUPER_ADMIN', 'COMPANY_ADMIN'),
   CorrespondentController.delete
+);
+
+// ============ Custom Fields ============
+router.get('/custom-fields', CustomFieldController.list);
+router.post(
+  '/custom-fields',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN'),
+  CustomFieldController.create
+);
+router.patch(
+  '/custom-fields/:id',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN'),
+  CustomFieldController.update
+);
+router.delete(
+  '/custom-fields/:id',
+  checkRole('SUPER_ADMIN', 'COMPANY_ADMIN'),
+  CustomFieldController.remove
 );
 
 export default router;

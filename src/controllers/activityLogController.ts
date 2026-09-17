@@ -49,7 +49,7 @@ export class ActivityLogController {
         prisma.activityLog.findMany({
           where,
           include: {
-            user: { select: { id: true, name: true, email: true } },
+            user: { select: { id: true, name: true, email: true, role: true } },
           },
           orderBy: { createdAt: 'desc' },
           skip,
@@ -85,7 +85,7 @@ export class ActivityLogController {
 
       const logs = await prisma.activityLog.findMany({
         where: { userId },
-        include: { user: { select: { id: true, name: true, email: true } } },
+        include: { user: { select: { id: true, name: true, email: true, role: true } } },
         orderBy: { createdAt: 'desc' },
         take: Number(limit),
       });

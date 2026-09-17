@@ -39,7 +39,14 @@ const fileFilter = (
     'image/webp',
   ];
 
-  if (allowedMimes.includes(file.mimetype)) {
+  const allowedExtensions = [
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+    'txt', 'csv', 'md', 'json', 'jpg', 'jpeg', 'png', 'gif', 'webp',
+  ];
+  const ext = path.extname(file.originalname).slice(1).toLowerCase();
+
+  // Browser sering mengirim application/octet-stream untuk .md/.csv → cek ekstensi juga.
+  if (allowedMimes.includes(file.mimetype) || allowedExtensions.includes(ext)) {
     cb(null, true);
   } else {
     cb(new Error(`File type not allowed: ${file.mimetype}`));

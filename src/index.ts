@@ -13,6 +13,10 @@ import shareRoutes from './routes/shareRoutes.js';
 import activityLogRoutes from './routes/activityLogRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import metadataRoutes from './routes/metadataRoutes.js';
+import searchRoutes from './routes/searchRoutes.js';
+import statsRoutes from './routes/statsRoutes.js';
+import workflowRoutes from './routes/workflowRoutes.js';
+import publicRoutes from './routes/publicRoutes.js';
 
 dotenv.config();
 
@@ -33,7 +37,7 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-app.use('/uploads', express.static(process.env.UPLOAD_DIR || './uploads'));
+// Berkas TIDAK disajikan statis: akses lewat GET /api/documents/:id/file (cek izin + audit).
 
 app.use('/api/auth', authRoutes);
 app.use('/api/documents', documentRoutes);
@@ -42,6 +46,10 @@ app.use('/api/shares', shareRoutes);
 app.use('/api/activity-logs', activityLogRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/metadata', metadataRoutes);
+app.use('/api/search', searchRoutes);
+app.use('/api/stats', statsRoutes);
+app.use('/api/workflows', workflowRoutes);
+app.use('/api/public', publicRoutes);
 
 
 app.get('/healthz', (req, res) => {

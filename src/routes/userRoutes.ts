@@ -7,6 +7,9 @@ const router = Router();
 
 router.use(verifyToken);
 
+// Cari pengguna untuk dibagikan dokumen (semua role) — HARUS di atas /:id
+router.get('/search', UserController.searchUsers);
+
 // List users (admin only)
 router.get(
   '/',
