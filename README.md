@@ -10,6 +10,7 @@ cp .env.example .env          # isi DATABASE_URL + JWT_SECRET + JWT_REFRESH_SECR
 npm install
 npm run db:migrate            # prisma migrate deploy + prisma generate
 npm run seed                  # akun demo 4 peran + metadata + folder/dokumen contoh (idempoten)
+npm run reindex               # (opsional) indeks ulang isi berkas dokumen lama — PDF/DOCX/teks
 npm run dev                   # http://localhost:5000
 ```
 
@@ -37,7 +38,7 @@ Semua respons `{ success, data, pagination? }` (camelCase), kecuali `/api/shares
 
 | Modul | Endpoint |
 |---|---|
-| Auth | `POST /auth/register · login · refresh-token · logout`, `GET /auth/me` |
+| Auth | `POST /auth/register · login · refresh-token · logout`, `GET /auth/me`, `PATCH /auth/me` (ubah nama sendiri), `POST /auth/change-password` (wajib sandi lama; sesi lain dicabut) |
 | Folder | `GET /folders` (tree 3 tingkat), `GET /folders/all` (datar, semua tingkat), `POST /folders`, `PATCH /folders/:id/rename · move`, `DELETE /folders/:id` |
 | Dokumen | `GET /documents?folderId&status&search&page&limit`, `POST /documents` (multipart `file,title,folderId,description,allowDuplicate`), `GET · PATCH · DELETE /documents/:id`, `PATCH /documents/:id/move · meta · status`, `POST /documents/bulk-meta` |
 | Berkas & versi | `GET /documents/:id/file?version=&download=1`, `GET · POST /documents/:id/versions`, `GET /documents/:id/content · history · similar` |
@@ -47,7 +48,7 @@ Semua respons `{ success, data, pagination? }` (camelCase), kecuali `/api/shares
 | Tautan publik | `GET · POST /shares/documents/:id/links`, `DELETE /shares/links/:linkId`, **publik:** `GET /public/share/:token`, `GET /public/share/:token/file` |
 | Metadata | `/metadata/tags · document-types · correspondents · custom-fields` (GET, POST, PATCH `/:id`, DELETE `/:id`) |
 | Otomatisasi | `GET · POST /workflows`, `PATCH · DELETE /workflows/:id`, `POST /workflows/:id/move` — dievaluasi saat unggah & status berubah (`src/lib/automation.ts`) |
-| Pencarian | `GET /search?q=&limit=` — folder + dokumen (judul, deskripsi, ASN, tag, tipe, pihak, isi berkas teks) |
+| Pencarian | `GET /search?q=&limit=` — folder + dokumen (judul, deskripsi, ASN, tag, tipe, pihak, **isi berkas**: txt/csv/md/json, PDF berlapis teks, DOCX — diekstrak saat unggah, `src/utils/fileInfo.ts`; PDF hasil scan butuh OCR, belum ada) |
 | Statistik | `GET /stats/dashboard?days=7` |
 | Pengguna | `GET /users/search?q=` (semua peran), `GET · POST /users`, `GET · PATCH · DELETE /users/:id`, `POST /users/:id/reset-password` |
 | Audit | `GET /activity-logs` (admin + auditor), `/activity-logs/me`, `/stats`, `/export` (CSV) |

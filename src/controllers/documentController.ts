@@ -221,7 +221,7 @@ export const uploadDocument = async (
         uploadedBy: userId,
         currentVersion: 1,
         status: 'DRAFT',
-        contentText: extractText(file.path, extension),
+        contentText: await extractText(file.path, extension),
         versions: {
           create: {
             versionNumber: 1,
@@ -537,7 +537,7 @@ export const uploadNewVersion = async (
         currentVersion: newVersion,
         extension,
         sizeBytes: BigInt(file.size),
-        contentText: extractText(file.path, extension),
+        contentText: await extractText(file.path, extension),
         versions: {
           create: {
             versionNumber: newVersion,

@@ -361,3 +361,105 @@ export const getCurrentUser = async (req: Request, res: Response) => {
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
+// ============ PROFIL SENDIRI ============
+const updateProfileSchema = z.object({
+  name: z.string().trim().min(2, 'Nama minimal 2 karakter').max(100),
+});
+
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'Kata sandi saat ini wajib diisi'),
+  newPassword: z.string().min(8, 'Kata sandi baru minimal 8 karakter'),
+});
+
+// PATCH /auth/me — ubah nama sendiri (email & peran hanya oleh admin)
+export const updateProfile = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthRequest).user!.id;
+    const validated = updateProfileSchema.parse(req.body);
+
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { name: validated.name },
+      select: { id: true, email: true, name: true, role: true },
+    });
+
+    await logActivityWithRequest(
+      req,
+      userId,
+      'UPDATE_USER',
+      { mode: 'self', changes: validated },
+      'USER',
+      userId
+    );
+
+    res.json({ success: true, message: 'Profil diperbarui', data: user });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        success: false,
+        message: error.issues[0]?.message ?? 'Validation error',
+        errors: error.issues,
+      });
+    }
+    console.error('Update profile error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// POST /auth/change-password — wajib kata sandi lama; sesi lain (refresh token) dicabut
+export const changePassword = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthRequest).user!.id;
+    const validated = changePasswordSchema.parse(req.body);
+
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new AppError('User not found', 404);
+
+    const matches = await bcrypt.compare(validated.currentPassword, user.passwordHash);
+    if (!matches) throw new AppError('Kata sandi saat ini salah.', 400);
+
+    if (validated.currentPassword === validated.newPassword) {
+      throw new AppError('Kata sandi baru harus berbeda dari yang lama.', 400);
+    }
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: { passwordHash: await bcrypt.hash(validated.newPassword, SALT_ROUNDS) },
+    });
+
+    // Perangkat lain harus login ulang; sesi ini dipertahankan lewat refresh token yang dikirim.
+    const keep = typeof req.body.refreshToken === 'string' ? hashToken(req.body.refreshToken) : null;
+    await prisma.refreshToken.updateMany({
+      where: {
+        userId,
+        revokedAt: null,
+        ...(keep ? { tokenHash: { not: keep } } : {}),
+      },
+      data: { revokedAt: new Date() },
+    });
+
+    await logActivityWithRequest(
+      req,
+      userId,
+      'RESET_PASSWORD',
+      { mode: 'self' },
+      'USER',
+      userId
+    );
+
+    res.json({ success: true, message: 'Kata sandi berhasil diubah' });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        success: false,
+        message: error.issues[0]?.message ?? 'Validation error',
+        errors: error.issues,
+      });
+    }
+    if (error instanceof AppError) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
+    console.error('Change password error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
