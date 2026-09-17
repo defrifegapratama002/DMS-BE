@@ -12,6 +12,7 @@ npm run db:migrate            # prisma migrate deploy + prisma generate
 npm run seed                  # akun demo 4 peran + metadata + folder/dokumen contoh (idempoten)
 npm run reindex               # (opsional) indeks ulang isi berkas dokumen lama — PDF/DOCX/teks
 npm run dev                   # http://localhost:5000
+npm run test:api              # 47 cek endpoint terhadap server yang hidup (butuh seed)
 ```
 
 Akun demo (password `Password123!`): `super@dms.test` (SUPER_ADMIN), `admin@dms.test` (COMPANY_ADMIN),

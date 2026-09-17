@@ -68,7 +68,25 @@ const SAMPLE_DOCS = [
   },
 ] as const;
 
+/**
+ * Uji e2e (dms-fe/tests/checklist.mjs) membuat user `uji-checklist-*@dms.test` dan hanya bisa
+ * menonaktifkannya (API tidak punya hapus permanen) — bersihkan di sini agar tidak menumpuk.
+ */
+async function removeTestUsers() {
+  const users = await prisma.user.findMany({
+    where: { email: { startsWith: 'uji-checklist-' } },
+    select: { id: true },
+  });
+  const ids = users.map((u) => u.id);
+  if (ids.length === 0) return;
+  await prisma.activityLog.deleteMany({ where: { userId: { in: ids } } });
+  await prisma.user.deleteMany({ where: { id: { in: ids } } });
+  console.log(`Membersihkan ${ids.length} user uji.`);
+}
+
 async function main() {
+  await removeTestUsers();
+
   const passwordHash = await bcrypt.hash(DEMO_PASSWORD, 10);
 
   for (const u of USERS) {

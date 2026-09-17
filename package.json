@@ -12,6 +12,7 @@
     "lint:fix": "eslint src --fix",
     "seed": "tsx prisma/seed.ts",
     "reindex": "tsx prisma/reindex.ts",
+    "test:api": "node tests/api.smoke.mjs",
     "db:migrate": "prisma migrate deploy && prisma generate"
   },
   "keywords": [],
